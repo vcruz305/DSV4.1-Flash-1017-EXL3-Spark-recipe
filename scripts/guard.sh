@@ -61,8 +61,14 @@ case "$MODE" in
       if grep -qvE '=0$' "$f"; then before="$f"; break; fi
     done
     if [ -n "$before" ]; then
+      # Apply only the three keys serve.sh saves, and only integer values: this file is
+      # replayed with sudo, so nothing else in it may reach sysctl.
       while IFS='=' read -r k v; do
-        [ -n "${k:-}" ] || continue
+        case "$k" in
+          vm.compaction_proactiveness|vm.watermark_boost_factor|vm.swappiness) ;;
+          *) [ -n "${k:-}" ] && echo "ignoring unexpected key in $before: $k" >&2; continue ;;
+        esac
+        case "$v" in ''|*[!0-9]*) echo "ignoring non-integer value for $k in $before" >&2; continue ;; esac
         sudo -n sysctl -q "$k=$v" 2>/dev/null || true
       done <"$before"
       echo "stopped; sysctls restored from $before"

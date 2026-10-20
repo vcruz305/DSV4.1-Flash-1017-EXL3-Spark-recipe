@@ -144,6 +144,9 @@ All-experts-resident does not fit under vLLM on this part: un-aliasing layers
 boot. That is the whole reason for the side file. Guard policy: 0.5 GiB
 MemAvailable floor, 64 MiB swap-growth allowance, 0.05 s sampling
 (`scripts/guard.sh`). Do not serve without it armed.
+The guard runs as root and keeps its files (`stage`, `guard.log`, `sysctl.before`) in the
+run directory, which the container cannot see: it gets only `$RUN/ctr` at `/mem`.
+`guard.sh stop` restores only the three sysctls `serve.sh` changes, and only integer values.
 
 ## Measured speed
 
@@ -387,6 +390,12 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
 
 ## Known limits
 
+- **Oversized sampling lists get a 400, not a crash.** The DSpark path samples on vLLM's
+  Model Runner V2, which raises inside the engine core, and so stops the whole server, on a
+  request with more than 1,024 `allowed_token_ids`, more than 1,024 `logit_bias` entries,
+  more than 128 stop ids together with `min_tokens`, or more bad words (count or total
+  tokens) than `VLLM_MAX_NUM_BAD_WORDS` / `VLLM_MAX_BAD_WORDS_TOTAL_TOKENS`. The shim checks
+  the same limits in the API server and answers 400 instead.
 - **50-60 tok/s is not reached.** 31-34 tok/s is the best measured so far;
   kernel work continues on the fork branch. At the measured 4.7 accepted tokens/step,
   ~48 tok/s needs ~42 ms out of a 140 ms step (~50 tok/s needs ~45 ms); the

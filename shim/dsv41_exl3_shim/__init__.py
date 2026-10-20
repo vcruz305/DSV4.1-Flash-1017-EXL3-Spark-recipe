@@ -327,6 +327,62 @@ def _install_rope_trim() -> None:
     DefaultModelLoader.load_model = load_model
 
 
+def _install_sampling_caps() -> None:
+    """Reject over-size sampling lists in the API server with a 400.
+
+    DSpark runs on Model Runner V2, whose sampler pre-sizes per-request buffers
+    (``v1/worker/gpu/sample/logit_bias.py``, ``bad_words.py``) and raises
+    ``ValueError`` inside EngineCore when a request exceeds them. EngineCore
+    treats that as fatal, so one request with 1,025 ``allowed_token_ids`` takes
+    the whole server down. The frontend only range-checks these lists
+    (upstream: vllm-project/vllm#55164). Check every limit the sampler enforces
+    here, after ``update_from_tokenizer`` has filled in the final stop and
+    bad-word ids: allowed token ids, logit-bias entries, stop ids under
+    ``min_tokens``, number of bad words and their total tokens. The limits are
+    read from the sampler module so they cannot drift from what it enforces.
+    """
+    from vllm import envs
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    orig = SamplingParams.update_from_tokenizer
+    if getattr(orig, "_dsv41_caps", False):
+        return
+    try:
+        from vllm.v1.worker.gpu.sample import logit_bias as _lb
+
+        max_allowed = int(_lb.MAX_NUM_ALLOWED_TOKEN_IDS)
+        max_bias = int(_lb.MAX_NUM_LOGIT_BIAS_TOKENS)
+        max_stop = int(_lb.MAX_NUM_STOP_TOKEN_IDS)
+    except Exception:  # sampler module moved: fall back to the values it had
+        max_allowed, max_bias, max_stop = 1024, 1024, 128
+
+    def _reject(msg, parameter):
+        raise VLLMValidationError(msg, parameter=parameter)
+
+    def update_from_tokenizer(self, tokenizer):
+        orig(self, tokenizer)
+        n = len(self.allowed_token_ids or ())
+        if n > max_allowed:
+            _reject(f"allowed_token_ids has {n} ids; the max is {max_allowed}", "allowed_token_ids")
+        n = len(self.logit_bias or ())
+        if n > max_bias:
+            _reject(f"logit_bias has {n} entries; the max is {max_bias}", "logit_bias")
+        n = len(self.all_stop_token_ids or ())
+        if (self.min_tokens or 0) > 0 and n > max_stop:
+            _reject(f"min_tokens needs at most {max_stop} stop ids (incl. EOS); got {n}", "stop_token_ids")
+        words = self.bad_words_token_ids or ()
+        max_words = int(getattr(envs, "VLLM_MAX_NUM_BAD_WORDS", 128))
+        if len(words) > max_words:
+            _reject(f"bad_words has {len(words)} entries; the max is {max_words}", "bad_words")
+        n = sum(len(w) for w in words)
+        max_tok = int(envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS)
+        if n > max_tok:
+            _reject(f"bad_words tokenize to {n} tokens; the max is {max_tok}", "bad_words")
+
+    update_from_tokenizer._dsv41_caps = True
+    SamplingParams.update_from_tokenizer = update_from_tokenizer
+
 
 def _pack_head_trellis() -> tuple[str, int] | None:
     """Return (shard, K_bits) for the pack's EXL3 output head, or None."""
@@ -509,6 +565,7 @@ def register() -> None:
     _install_exl3_head()
     _install_mem_probe()
     _install_dsml_stop()
+    _install_sampling_caps()
 
     if getattr(register, "_installed", False):
         return

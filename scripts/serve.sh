@@ -29,7 +29,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1: would launch container=$CONTAINER image=$IMAGE"
   echo "  model  : $MODEL_DIR -> /models/$MODEL_NAME"
   echo "  alias  : $ALIAS_DIR -> /alias"
-  echo "  run dir: $RUN -> /mem"
+  echo "  run dir: $RUN/ctr -> /mem (guard files stay in $RUN, outside the container)"
   echo "  jit    : $JIT_HOST -> $JIT (via $CACHE_DIR -> /cache)"
   echo "  port   : $API_PORT"
   echo "  maxlen : $MAXLEN  kv=$KVB  mnbt=$MNBT  lpt=$LPT  mtp_k=$MTP_K"
@@ -64,7 +64,10 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-mkdir -p "$RUN" "$JIT_HOST"/{b12x/compile,b12x/cute,cute-dsl,tilelang,triton,nv-compute,vllm-r5o}
+# The container gets $RUN/ctr only: guard.sh runs as root and reads/appends files in $RUN
+# (stage, guard.log, sysctl.before), so the container must not be able to rewrite them or
+# swap them for symlinks.
+mkdir -p "$RUN/ctr" "$JIT_HOST"/{b12x/compile,b12x/cute,cute-dsl,tilelang,triton,nv-compute,vllm-r5o}
 
 # ---- first-boot compile headroom ------------------------------------------
 # An empty JIT cache makes this boot compile ~156 TileLang/B12X kernels. The
@@ -172,7 +175,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -v "$MODELS_DIR":/models:ro \
   -v "$CACHE_DIR":/cache:rw \
   -v "$ALIAS_DIR":/alias:ro \
-  -v "$RUN":/mem:rw \
+  -v "$RUN/ctr":/mem:rw \
   -v "$HERE/serve_inner.sh":/root/serve.sh:ro \
   -p "$API_PORT":8000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
