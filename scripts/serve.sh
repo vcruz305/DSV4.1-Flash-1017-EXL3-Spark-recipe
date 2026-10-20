@@ -22,8 +22,8 @@ RUN="${RUN_DIR:-$RUNS_DIR/$TS}"
 JIT_HOST="$CACHE_DIR/kkref/jit"
 JIT="/cache/kkref/jit"
 
-PCF=--no-enable-prefix-caching
-[ "$PREFIX_CACHING" = "1" ] && PCF=--enable-prefix-caching
+PCF=--enable-prefix-caching
+[ "$PREFIX_CACHING" = "0" ] && PCF=--no-enable-prefix-caching
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1: would launch container=$CONTAINER image=$IMAGE"

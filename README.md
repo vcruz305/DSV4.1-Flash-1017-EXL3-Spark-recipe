@@ -103,7 +103,7 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 | `--max-model-len 524288` | 512K tokens, the largest limit measured clean on one Spark: needle retrieval at 520K, minimum MemAvailable 2.23 GiB under that prefill, short-prompt decode 147.2 ms/step against 140.5-142.0 at 32K (see Measured long context). The model is rated for 1,048,576 (YaRN x16 over 65,536); 1M does not fit (the prefill transient grows with prompt length) |
 | `--max-num-batched-tokens 2112 --long-prefill-token-threshold 2047` | the aligned-prefill chunk; 8192 does not fit |
 | `--kv-cache-memory-bytes 1073741824` | 1 GiB KV at the engine's `auto` (bf16) cache dtype. The token count vLLM reports depends on `--max-model-len` for this hybrid attention (sliding-window and compressed groups): 236,089 at 32K, 394,892 at 64K, 595,001 at 128K, 760,070 at 229K, 959,768 at 524K (1.83x one full-length request) |
-| `--no-enable-prefix-caching` | measured off for single-stream decode; `PREFIX_CACHING=1` turns it on for repeated prefixes (see Prefix caching (opt-in)) |
+| `--enable-prefix-caching` | default on: a request that repeats a cached prefix (follow-up turns, new questions on the same document) skips its prefill, 518K tokens to first token in 2.5-3.7 s instead of 464 s; no step-time cost measured. `PREFIX_CACHING=0` turns it off (see Prefix caching) |
 | `B12X_AUTOTUNE=0` | the base image's optional per-kernel autotune sweep is hours; prebuilt artifacts are the measured path |
 | `--security-opt seccomp=unconfined --security-opt label=disable --ulimit memlock=-1` | the Engram reader initialises io_uring; a default seccomp profile aborts it |
 | `--shm-size=2g` | measured value; the engine's shared-memory use is small at `--max-num-seqs 1` |
@@ -240,8 +240,10 @@ halves varied-text prefill (446 vs 718 tok/s at ~7K), so 2112 stays.
 
 1 GiB KV pool throughout. One request per row: varied log-style filler (unique ids and
 numbers on every line), a passphrase hidden at the given depth, a plain-text question at
-the end, greedy, 256 generated tokens (192 on the two longest rows) (`bench/ctx_probe.py`).
-Prefix caching is off, so every row is a full prefill.
+the end, greedy, 256 generated tokens (192 on the two longest rows, 128 on the prefix-caching
+row) (`bench/ctx_probe.py`). Every row is a full prefill: the earlier rows were measured with
+prefix caching off, and the probe now starts each prompt with a per-run nonce, so a repeated
+run cannot hit the cache.
 
 | `--max-model-len` | Prompt tokens | Needle depth | TTFT | Prefill tok/s | Decode tok/s at depth | Retrieved | Min MemAvailable |
 |---:|---:|---:|---:|---:|---:|---|---:|
@@ -252,6 +254,7 @@ Prefix caching is off, so every row is a full prefill.
 | **524,288 (default)** | 393,176 | 0.1 | 380.6 s | 1,033 | 29.3 | yes | 2.07 GiB |
 | **524,288 (default)** | 519,984 | 0.5 | 516.4 s | 1,007 | 29.3 | yes | 2.23 GiB |
 | **524,288 (default), shipped cold set** | 518,103 | 0.5 | 470.2 s | 1,102 | 25.6 | yes | 2.19 GiB |
+| **524,288 (default), shipped cold set, prefix caching on (default)** | 517,979 | 0.3 / 0.7 | 466.6 s | 1,110 | 22.9 | yes | 2.39 GiB |
 
 Short prompts (bench7, 512 tokens, k=5, warm boot), by `--max-model-len`:
 
@@ -270,19 +273,49 @@ long prompts. Prefill does not slow with depth on this text (1.0-1.2K tok/s from
 520K); it is faster than the stdlib-source ladder above because log lines route to fewer
 experts.
 
-**Prefix caching (opt-in).** `PREFIX_CACHING=1 bash scripts/serve.sh` serves with
-`--enable-prefix-caching`; the default stays off. It pays when requests share a long prefix
-(multi-turn chat, agents re-sending history). Measured on two other boxes at `MAXLEN=32768`,
-`KVB=268435456` (off on one, on on the other; bench7 within 1 % between them), eight greedy lookups (`req=<id>` -> `latency_ms`) against one shared
-7.5K-token log prompt:
+**Prefix caching (default on).** `serve.sh` serves with `--enable-prefix-caching`;
+`PREFIX_CACHING=0` turns it off. A request whose prompt starts with a prefix that is still in the
+KV pool skips the prefill of that prefix: follow-up turns in a chat or an agent loop, and new
+questions about a document already sent. Measured at the shipped default (`MAXLEN=524288`,
+1 GiB KV pool, shipped cold set, W2 kernel, one boot) on varied log text, greedy
+(`bench/prefix_probe.py`; the rows with tok/step are `bench/prefix_accept.py`, which reads the
+spec-decode and prefix-cache counters from `/metrics` around each request):
+
+| Prompt tokens | Request | TTFT | Decode tok/s | tok/step | Retrieved |
+|---:|---|---:|---:|---:|---|
+| 517,979 | first (full prefill) | 466.6 s | 22.9 | | yes |
+| 517,976 | same document, new question | 3.46 s, 3.64 s | 13.2, 33.0 | | yes |
+| 517,979 | same request again | 3.70 s, 3.36 s | 13.6, 15.1 | | yes |
+| 518,141 | follow-up turn (first request + its answer + a question) | 2.67 s, 3.51 s | 35.6, 28.1 | | yes |
+| 517,916 | first (full prefill), 384 tokens | 464.3 s | 26.2 | 3.60 | yes |
+| 517,916 | same request again, twice | 2.64 s, 2.48 s | 27.2, 23.7 | 3.69, 3.03 | yes |
+| 131,051 | first (full prefill) | 108.0 s | 38.1 | | yes |
+| 131,048-131,213 | new question / same request / follow-up turn | 1.26-1.41 s | 16.4-41.3 | | yes |
+| 129,614 | first, then the same request twice, 384 tokens | 104.7 s, then 1.21 s, 1.12 s | 22.4, 24.6, 24.7 | 2.92, 3.14, 3.10 | yes |
+
+- The cache served 99.95 % of the prompt tokens on the repeated 518K requests
+  (`vllm:prefix_cache_hits_total` / `queries_total`).
+- Decode is not slower after a cache hit. The spread in decode tok/s is draft acceptance, which
+  follows what the model writes: the same 518K request decoded 3.60 tokens per step cold and
+  3.69 / 3.03 cached, at 127-137 ms per step, the same step time as short prompts. Summarizing a
+  random log is harder to draft than bench7's prompts, so acceptance at depth is lower.
+- No cost when nothing is reused: bench7 (its prompts share no long prefix) gave 127.6 ms/step
+  (123.0-133.8), 5.07 tok/step, 39.6 tok/s with prefix caching on, against 129.7 / 131.3 ms/step
+  off on two boots of the same image and cold set.
+- Memory: minimum MemAvailable 2.39 GiB over the whole run (0.2 s sampling), no swap.
+- The pool holds 959,768 tokens at this `MAXLEN`, 1.85x one full-length request, so one ~518K
+  document stays cached at a time: a second long document evicts the first (least recently used).
+  The cache lives in the KV pool on the GPU; a restart empties it.
+- The first request with a new document still pays the full prefill (~1.1K tok/s on this text).
+
+Earlier, on two other boxes at `MAXLEN=32768`, `KVB=268435456` (off on one, on on the other;
+bench7 within 1 % between them), eight greedy lookups (`req=<id>` -> `latency_ms`) against one
+shared 7.5K-token log prompt:
 
 | Prefix caching | Lookups correct | Request time, first | Requests 2-8 | bench7 ms/step |
 |---|---:|---:|---:|---:|
 | off | 8/8 | 10.6 s | 9.9-12.0 s | 142.4-149.4 |
 | on | 8/8 | 10.4 s | 1.6-2.6 s | 143.4 |
-
-bench7 prompts do not share prefixes, so its step time is the no-hit cost. Not measured at
-long `MAXLEN` or with prompts past 7.5K tokens.
 
 **Smaller KV pool at 32K.** At `MAXLEN=32768` one request needs far less than the 1 GiB
 pool. `KVB=268435456` (256 MiB; vLLM reports 59,022 tokens, 1.80x one 32K request) gives
@@ -480,8 +513,7 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
 - Do not raise `--max-num-batched-tokens` to 8192 without re-measuring; it OOMs.
 - Do not build the fork without `MOE_TILESIZE_K=16`; you get the 32-row tile,
   ~34 % slower per step (190.6 vs 142.0 ms), and none of these numbers apply.
-- Do not enable prefix caching (measured off) or `B12X_AUTOTUNE` (hours of
-  bring-up) as a "helpful" default.
+- Do not enable `B12X_AUTOTUNE` (hours of bring-up) as a "helpful" default.
 - Do not run the container without `seccomp=unconfined`; io_uring init fails.
 - Do not print or commit `HF_TOKEN`.
 
