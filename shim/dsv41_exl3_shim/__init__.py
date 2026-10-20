@@ -41,11 +41,23 @@ DSML tool-call stop (``DSV41_DSML_STOP=1``)
 Adds the stop string ``</|DSML| invoke>\n</`` (kept in the output) to chat
 requests that carry tools, so a reply ends at the first closing tag after a
 closed invoke.  See ``_install_dsml_stop``.
+
+DSML parameter repair (``DSV41_DSML_PARAM_REPAIR=1``, on by default)
+--------------------------------------------------------------------
+Issue #15 form (b): when the model leaves out a parameter's closer and writes
+a run of invented closing tags instead, the parser drops the argument
+(non-streaming) or streams the junk inside it.  Only that structural
+violation is repaired: the trailing unmatched closing tags are stripped and
+the closer restored, with one warning line.  Properly closed values are never
+touched.  In streaming each call's arguments are held until the call is
+complete.  See ``_install_dsml_param_repair``.
 """
 
 from __future__ import annotations
 
+import copy
 import os
+import re
 
 __all__ = ["register"]
 
@@ -548,6 +560,473 @@ def _install_dsml_stop() -> None:
     DeepSeekV41Parser.adjust_request = adjust_request
 
 
+# --- DSML parameter repair (DSV41_DSML_PARAM_REPAIR=1) ----------------------
+#
+# (In the DSML tags below, ``|`` stands for U+FF5C, the fullwidth bar, which
+# this source never writes literally: every marker is built from ``\uff5c``.)
+#
+# Form (b) of recipe issue #15: at temperature 1.0 the model sometimes leaves
+# out a parameter's closing tag and appends a run of invented closing tags
+# (``</del></chat></dash></b>``) until the invoke close, the calls close, the
+# stop string or EOS.  Without the closer the parser either drops the real
+# argument silently (non-streaming) or keeps the junk inside the streamed
+# argument -- both corrupt a call the agent would execute.
+#
+# The repair is strictly structural: it only acts when a parameter's closer
+# is missing, and only strips the *trailing* run of closing tags that have no
+# matching opener inside that value.  Values that are properly closed are
+# never touched (a value may legitimately contain or end with ``</div>``
+# ``</body></html>``), and a matched pair inside a value is never stripped.
+# The missing closer is restored so the parser sees the model's real argument.
+# A truncated value that does NOT end in such a junk run is left alone: there
+# is no evidence what the model wanted, and half a shell command is more
+# dangerous than a dropped one.
+
+_DSML_MARKS = (
+    ("<\uff5cDSML\uff5c parameter", "P"),          # parameter opening tag
+    ("</\uff5cDSML\uff5c parameter>", "p"),        # parameter closer
+    ("<\uff5cDSML\uff5c invoke", "I"),             # invoke opening tag
+    ("</\uff5cDSML\uff5c invoke>", "i"),           # invoke closer
+    ("<\uff5cDSML\uff5c calls>", "O"),             # calls opening tag
+    ("</\uff5cDSML\uff5c calls>", "C"),            # calls closer
+)
+_DSML_P_CLOSE = "</\uff5cDSML\uff5c parameter>"
+# A well-formed call newline-separates the parameter closer from whatever
+# follows it, so the repair restores that glue too.
+_DSML_P_CLOSE_GLUE = _DSML_P_CLOSE + "\n"
+
+_RE_CLOSE_TAG = re.compile(r"</[A-Za-z][^<>]*>")
+_RE_PARTIAL_TAG = re.compile(r"</[A-Za-z]*\Z|<\Z")
+
+
+def _dsml_safe(s: str) -> str:
+    """One-line-safe: never let the fullwidth bar reach a log."""
+    return s.replace("\uff5c", "|")
+
+
+def _dsml_events(text: str):
+    evs = []
+    for mark, kind in _DSML_MARKS:
+        start = 0
+        while True:
+            idx = text.find(mark, start)
+            if idx < 0:
+                break
+            evs.append((idx, kind))
+            start = idx + 1
+    evs.sort()
+    return evs
+
+
+def _dsml_partial_start(value: str):
+    """Start of a trailing fragment that could still become a closing tag or
+    a DSML marker: an incomplete ``</name``, a bare ``<``, or a proper prefix
+    of a DSML marker.  None when the value ends in plain content."""
+    best = None
+    m = _RE_PARTIAL_TAG.search(value)
+    if m:
+        best = m.start()
+    for mark, _kind in _DSML_MARKS:
+        for n in range(len(mark) - 1, 0, -1):
+            if n <= len(value) and value.endswith(mark[:n]):
+                pos = len(value) - n
+                if best is None or pos < best:
+                    best = pos
+                break
+    return best
+
+
+_DSML_WS = " \t\r\n\f\v"
+
+
+def _dsml_junk_start(value: str):
+    """Start of the trailing junk run: complete closing tags with no matching
+    opener anywhere earlier in the value, plus the partial fragment that
+    directly continues the run.  Whitespace inside or around the run is
+    consumed with it (the captured real shapes have a newline between the junk
+    and the invoke close).  None when the value does not end in such a run
+    (including when the last tag has a matching opener)."""
+    frag = _dsml_partial_start(value)
+    end = frag if frag is not None else len(value)
+    while end > 0 and value[end - 1] in _DSML_WS:
+        end -= 1
+    stripped = 0
+    junk_start = None
+    while end > 0:
+        hit = None
+        for m in _RE_CLOSE_TAG.finditer(value):
+            if m.end() == end:
+                hit = m
+                break
+            if m.start() >= end:
+                break
+        if hit is None:
+            break
+        words = hit.group(0)[2:-1].split()
+        name = words[0] if words else ""
+        if not name or re.search(
+            "<" + re.escape(name) + r"[\s/>]", value[: hit.start()]
+        ):
+            break  # matched pair (or malformed): legitimate content
+        junk_start = hit.start()
+        stripped += 1
+        end = hit.start()
+        while end > 0 and value[end - 1] in _DSML_WS:
+            end -= 1
+    if stripped == 0:
+        return None
+    return junk_start
+
+
+def _dsml_scan(text: str):
+    """Walk the DSML structure of ``text``.
+
+    Returns ``(violations, open_param)``:
+
+    * ``violations``: ``(junk_start, boundary)`` pairs for parameters whose
+      closer is missing and whose value ends in an unmatched closing-tag run,
+      where the region is terminated by a real structural marker.
+    * ``open_param``: ``(value_start, junk_start_or_None)`` for a parameter
+      that is still unterminated at the end of ``text`` (None if none).
+    """
+    violations = []
+    open_start = None
+    for pos, kind in _dsml_events(text):
+        if open_start is not None:
+            if kind == "p":
+                # Properly closed: its value is legitimate content, whatever
+                # it ends with.  Never scanned, never repaired.
+                open_start = None
+                continue
+            js = _dsml_junk_start(text[open_start:pos])
+            if js is not None:
+                violations.append((open_start + js, pos))
+            open_start = None
+        if kind == "P":
+            gt = text.find(">", pos)
+            open_start = gt + 1 if gt >= 0 else len(text)
+    open_param = None
+    if open_start is not None:
+        js = _dsml_junk_start(text[open_start:])
+        open_param = (open_start, js)
+    return violations, open_param
+
+
+def _dsml_call_names(text: str, pos: int):
+    """(call, param) names for the parameter value that ends at ``pos``."""
+    call = param = "?"
+    p_at = text.rfind("<\uff5cDSML\uff5c parameter", 0, pos)
+    if p_at >= 0:
+        m = re.search(r'name="([^"]*)"', text[p_at:pos])
+        if m:
+            param = m.group(1)
+    i_at = text.rfind("<\uff5cDSML\uff5c invoke", 0, pos)
+    if i_at >= 0:
+        m = re.search(r'name="([^"]*)"', text[i_at:pos])
+        if m:
+            call = m.group(1)
+    return call, param
+
+
+def _dsml_repair_warning(text: str, junk_start: int, boundary: int) -> None:
+    call, param = _dsml_call_names(text, junk_start)
+    junk = text[junk_start:boundary]
+    print(
+        "DSML PARAM REPAIR: call=%s param=%s: missing parameter closer; "
+        "stripped %d chars of unmatched closing tags %r and restored the "
+        "closer" % (call, param, len(junk), _dsml_safe(junk[:60])),
+        flush=True,
+    )
+
+
+def _dsml_sanitize(text: str, warn: bool = True):
+    """Final-text repair.  Returns the sanitized text (the same object when
+    there is nothing to repair); ``warn`` prints one line per repair."""
+    violations, open_param = _dsml_scan(text)
+    edits = list(violations)
+    if open_param is not None and open_param[1] is not None:
+        edits.append((open_param[0] + open_param[1], len(text)))
+    if not edits:
+        return text
+    for junk_start, boundary in sorted(edits, reverse=True):
+        if warn:
+            _dsml_repair_warning(text, junk_start, boundary)
+        text = text[:junk_start] + _DSML_P_CLOSE_GLUE + text[boundary:]
+    return text
+
+
+def _dsml_request_has_tools(request) -> bool:
+    return bool(getattr(request, "tools", None)) and getattr(
+        request, "tool_choice", None
+    ) != "none"
+
+
+def _dsml_set_args(fn, value) -> None:
+    try:
+        fn.arguments = value
+    except Exception:
+        try:  # frozen model: fall back to the underlying storage
+            object.__setattr__(fn, "arguments", value)
+        except Exception:
+            pass
+
+
+# Streaming: hold each call's argument pieces until the call is complete.
+#
+# The parser always gets the raw text and token ids verbatim, so its own state
+# and every piece it emits are exactly what they are without the shim.  Only the
+# *argument* pieces are held back, per tool index, and released in one piece
+# once that call's invoke has closed (or the stream ends).  At release:
+#
+#   * the invoke has no parameter-closer violation -> release the parser's own
+#     pieces, concatenated (assembled arguments byte-identical to no shim);
+#   * it has one -> release the arguments the non-streaming parser gives for the
+#     repaired text instead, and drop any later pieces of that call.
+#
+# The call header (id, name) is never held, so clients see each call start as
+# before; only its arguments arrive at the invoke close instead of piecewise.
+
+_DSML_I_OPEN = "<\uff5cDSML\uff5c invoke"
+_DSML_I_CLOSE = "</\uff5cDSML\uff5c invoke>"
+_DSML_C_OPEN = "<\uff5cDSML\uff5c calls>"
+_DSML_C_CLOSE = "</\uff5cDSML\uff5c calls>"
+_DSML_SEEN_APIS: set = set()
+
+
+class _DsmlHold:
+    """Streaming state of one request (vLLM makes one parser per request)."""
+
+    __slots__ = ("raw", "calls_at", "scan", "opens", "closes", "held",
+                 "flushed", "repaired", "request", "classes")
+
+    def __init__(self):
+        self.raw = ""
+        self.calls_at = -1
+        self.scan = 0
+        self.opens: list = []      # start of each invoke opening tag
+        self.closes: list = []     # end of each invoke closer
+        self.held: dict = {}       # tool index -> held argument text
+        self.flushed: set = set()
+        self.repaired: set = set()
+        self.request = None
+        self.classes = None        # (DeltaMessage, DeltaToolCall, DeltaFunctionCall)
+
+
+def _dsml_hold(parser):
+    st = getattr(parser, "_dsv41_dsml_hold", None)
+    if st is None:
+        st = _DsmlHold()
+        try:
+            parser._dsv41_dsml_hold = st
+        except Exception:
+            return None  # no per-request slot: pass the stream through untouched
+    return st
+
+
+def _dsml_track(st: _DsmlHold, raw: str) -> None:
+    """Record invoke opens/closes in ``raw`` incrementally (positions are in
+    ``raw``; a text basis that does not extend the previous one restarts)."""
+    if not raw.startswith(st.raw):
+        st.calls_at, st.scan, st.opens, st.closes = -1, 0, [], []
+    st.raw = raw
+    if st.calls_at < 0:
+        at = raw.find(_DSML_C_OPEN, max(0, st.scan - len(_DSML_C_OPEN)))
+        if at < 0:
+            st.scan = len(raw)
+            return
+        st.calls_at = st.scan = at
+    start = max(st.calls_at, st.scan - len(_DSML_I_CLOSE))
+    for mark, out, end in ((_DSML_I_OPEN, st.opens, False), (_DSML_I_CLOSE, st.closes, True)):
+        pos = start
+        while True:
+            j = raw.find(mark, pos)
+            if j < 0:
+                break
+            v = j + len(mark) if end else j
+            if not out or v > out[-1]:
+                out.append(v)
+            pos = j + 1
+    st.scan = len(raw)
+
+
+def _dsml_clean_args(parser, st: _DsmlHold, idx: int, orig_extract):
+    """Arguments of call ``idx`` from the non-streaming parser on the repaired
+    text, or None when that cannot be had."""
+    if idx >= len(st.opens):
+        return None
+    end = st.closes[idx] if idx < len(st.closes) else len(st.raw)
+    # This call alone, so the result is calls[0] whatever the earlier calls were.
+    text = _DSML_C_OPEN + "\n" + _dsml_sanitize(st.raw[st.opens[idx]:end], warn=False)
+    if idx >= len(st.closes):
+        text += "\n" + _DSML_I_CLOSE
+    text += "\n" + _DSML_C_CLOSE
+    try:
+        tok = next((getattr(parser, a) for a in ("model_tokenizer", "tokenizer", "_tokenizer")
+                    if getattr(parser, a, None) is not None), None)
+        fresh = type(parser)(tok) if tok is not None else copy.copy(parser)
+        info = orig_extract(fresh, text, st.request)
+        calls = getattr(info, "tool_calls", None) or []
+        return calls[0].function.arguments if len(calls) == 1 else None
+    except Exception as exc:
+        print(f"DSML PARAM REPAIR: clean arguments failed: {exc!r}", flush=True)
+        return None
+
+
+def _dsml_hold_step(parser, st: _DsmlHold, dm, finished: bool, orig_extract):
+    """Hold the argument pieces in ``dm``; release every call that is complete."""
+    tcs = list(getattr(dm, "tool_calls", None) or [])
+    if dm is not None and tcs and st.classes is None:
+        fn0 = next((t.function for t in tcs if getattr(t, "function", None) is not None), None)
+        if fn0 is not None:
+            st.classes = (type(dm), type(tcs[0]), type(fn0))
+    kept = []
+    for tc in tcs:
+        idx = getattr(tc, "index", None)
+        fn = getattr(tc, "function", None)
+        piece = getattr(fn, "arguments", None) if fn is not None else None
+        if piece and idx is not None:
+            if idx in st.flushed:
+                if idx in st.repaired:
+                    _dsml_set_args(fn, None)  # tail of a call already sent clean
+            else:
+                st.held[idx] = st.held.get(idx, "") + piece
+                _dsml_set_args(fn, None)
+        if getattr(tc, "id", None) or (fn is not None and (getattr(fn, "name", None)
+                                                           or getattr(fn, "arguments", None))):
+            kept.append(tc)
+    ready = [i for i in sorted(st.held) if finished or i < len(st.closes)]
+    for idx in ready:
+        out = st.held.pop(idx)
+        st.flushed.add(idx)
+        a = st.opens[idx] if idx < len(st.opens) else st.calls_at
+        b = st.closes[idx] if idx < len(st.closes) else len(st.raw)
+        seg = st.raw[a:b]
+        viol, open_param = _dsml_scan(seg)
+        edits = list(viol)
+        if idx >= len(st.closes) and open_param is not None and open_param[1] is not None:
+            edits.append((open_param[0] + open_param[1], len(seg)))
+        if edits:
+            for js, bd in edits:
+                _dsml_repair_warning(seg, js, bd)
+            clean = _dsml_clean_args(parser, st, idx, orig_extract)
+            if clean is not None:
+                out = clean
+                st.repaired.add(idx)
+        if st.classes is None:
+            continue  # nothing was ever emitted for a call: nothing to release
+        dm_cls, tc_cls, fn_cls = st.classes
+        rel = tc_cls(index=idx, function=fn_cls(arguments=out))
+        at = next((k for k, t in enumerate(kept) if (getattr(t, "index", -1) or 0) > idx), len(kept))
+        kept.insert(at, rel)
+        if dm is None:
+            dm = dm_cls(tool_calls=[])
+    if dm is None:
+        return None
+    try:
+        dm.tool_calls = kept
+    except Exception:
+        object.__setattr__(dm, "tool_calls", kept)
+    if not kept and not finished and not any(
+            getattr(dm, k, None) for k in ("content", "reasoning", "reasoning_content")):
+        return None  # the delta only carried held argument text
+    return dm
+
+
+def _dsml_note_api(name: str) -> None:
+    if name not in _DSML_SEEN_APIS:
+        _DSML_SEEN_APIS.add(name)
+        print(f"DSML param repair: streaming tool calls via {name}", flush=True)
+
+
+def _install_dsml_param_repair() -> None:
+    """Repair a DSML parameter whose closer is missing (issue #15 form (b)).
+
+    Non-streaming (``parse``, ``extract_tool_calls``,
+    ``extract_tool_calls_from_content``): the raw text is repaired before the
+    parser sees it (``_dsml_sanitize``).  Streaming (``parse_delta``,
+    ``extract_tool_calls_streaming``, ``finish_streaming``): the parser sees the
+    raw text verbatim and each call's argument pieces are held until the call
+    is complete (``_dsml_hold_step``).  Requests without tools are untouched.
+    """
+    if os.environ.get("DSV41_DSML_PARAM_REPAIR", "1") in ("0", "", "false"):
+        return
+    try:
+        from vllm.parser.deepseek_v41 import DeepSeekV41Parser
+    except Exception as exc:  # pragma: no cover
+        print(f"DSML param repair install failed: {exc!r}", flush=True)
+        return
+    if getattr(DeepSeekV41Parser, "_dsv41_param_repair", False):
+        return
+    orig_extract = DeepSeekV41Parser.extract_tool_calls
+
+    def _wrap_nonstream(name):
+        orig = getattr(DeepSeekV41Parser, name)
+
+        def wrapper(self, model_output, request, *args, **kwargs):
+            if _dsml_request_has_tools(request) and isinstance(model_output, str):
+                model_output = _dsml_sanitize(model_output)
+            return orig(self, model_output, request, *args, **kwargs)
+
+        wrapper.__wrapped__ = orig
+        setattr(DeepSeekV41Parser, name, wrapper)
+
+    for name in ("parse", "extract_tool_calls", "extract_tool_calls_from_content"):
+        if hasattr(DeepSeekV41Parser, name):
+            _wrap_nonstream(name)
+
+    if hasattr(DeepSeekV41Parser, "parse_delta"):
+        orig_delta = DeepSeekV41Parser.parse_delta
+
+        def parse_delta(self, delta_text, delta_token_ids, request,
+                        prompt_token_ids=None, *, finished):
+            dm = orig_delta(self, delta_text, delta_token_ids, request,
+                            prompt_token_ids, finished=finished)
+            st = _dsml_hold(self) if _dsml_request_has_tools(request) else None
+            if st is None:
+                return dm
+            _dsml_note_api("parse_delta")
+            st.request = request
+            _dsml_track(st, st.raw + (delta_text or ""))
+            return _dsml_hold_step(self, st, dm, finished, orig_extract)
+
+        parse_delta.__wrapped__ = orig_delta
+        DeepSeekV41Parser.parse_delta = parse_delta
+
+    if hasattr(DeepSeekV41Parser, "extract_tool_calls_streaming"):
+        orig_stream = DeepSeekV41Parser.extract_tool_calls_streaming
+
+        def extract_tool_calls_streaming(self, previous_text, current_text, delta_text,
+                                         previous_token_ids, current_token_ids,
+                                         delta_token_ids, request):
+            dm = orig_stream(self, previous_text, current_text, delta_text,
+                             previous_token_ids, current_token_ids, delta_token_ids, request)
+            st = _dsml_hold(self) if _dsml_request_has_tools(request) else None
+            if st is None:
+                return dm
+            _dsml_note_api("extract_tool_calls_streaming")
+            st.request = request
+            _dsml_track(st, current_text or "")
+            return _dsml_hold_step(self, st, dm, False, orig_extract)
+
+        extract_tool_calls_streaming.__wrapped__ = orig_stream
+        DeepSeekV41Parser.extract_tool_calls_streaming = extract_tool_calls_streaming
+
+    if hasattr(DeepSeekV41Parser, "finish_streaming"):
+        orig_finish = DeepSeekV41Parser.finish_streaming
+
+        def finish_streaming(self):
+            dm = orig_finish(self)
+            st = getattr(self, "_dsv41_dsml_hold", None)
+            if st is None or st.request is None:
+                return dm
+            return _dsml_hold_step(self, st, dm, True, orig_extract)
+
+        finish_streaming.__wrapped__ = orig_finish
+        DeepSeekV41Parser.finish_streaming = finish_streaming
+
+    DeepSeekV41Parser._dsv41_param_repair = True
+
+
 def register() -> None:
     """Install the DSV4.1 EXL3 config. Idempotent."""
     import vllm_exl3
@@ -565,6 +1044,7 @@ def register() -> None:
     _install_exl3_head()
     _install_mem_probe()
     _install_dsml_stop()
+    _install_dsml_param_repair()
     _install_sampling_caps()
 
     if getattr(register, "_installed", False):

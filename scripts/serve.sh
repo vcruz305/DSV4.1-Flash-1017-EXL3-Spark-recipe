@@ -46,7 +46,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  VLLM_EXL3_ATS_ALIAS_LAYERS=$ATS_LAYERS VLLM_EXL3_ATS_ALIAS_MTP=$ATS_MTP VLLM_EXL3_ATS_ALIAS_EMBED=$ATS_EMBED"
   echo "  VLLM_DS41_ATTENTION_COMPUTE=auto VLLM_DS41_KERNEL_BACKEND=tilelang VLLM_DS41_HEAD_DTYPE=float32"
   echo "  VLLM_USE_FLASHINFER_SAMPLER=1 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
-  echo "  DSV41_DSML_STOP=$DSML_STOP"
+  echo "  DSV41_DSML_STOP=$DSML_STOP DSV41_DSML_PARAM_REPAIR=$DSML_PARAM_REPAIR"
   echo
   echo "vllm serve /models/$MODEL_NAME --served-model-name dsv41 --tokenizer-mode deepseek_v41 \\"
   echo "  --dtype bfloat16 --tensor-parallel-size 1 --distributed-executor-backend uni \\"
@@ -222,6 +222,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -e VLLM_USE_BREAKABLE_CUDAGRAPH=0 \
   -e DSV41_MEM_PROBE=1 \
   -e DSV41_DSML_STOP="$DSML_STOP" \
+  -e DSV41_DSML_PARAM_REPAIR="$DSML_PARAM_REPAIR" \
   -e VLLM_EXL3_MEM_WATERFALL=0 \
   -e VLLM_EXL3_MEM_WATERFALL_PATH= \
   -e MAXLEN="$MAXLEN" -e KVB="$KVB" -e MNBT="$MNBT" -e LPT="$LPT" \

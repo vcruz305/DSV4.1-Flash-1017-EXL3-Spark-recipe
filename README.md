@@ -413,13 +413,36 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   one at 32,313 tokens / 648 s for 6 valid calls. `DSML_STOP=1` (the default) adds the
   stop string `</|DSML| invoke>\n</`, kept in the output, to requests that carry tools:
   12 of 12 replays of the same states ended in 6-278 s with every closed invoke parsed,
-  streaming included. It does not catch the rarer form where the model leaves out
-  `</|DSML| parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
+  streaming included. `DSML_STOP=0` turns it off.
   Checked on the measurement box with `DSML_STOP=1` (the default): one tool request at
   `temperature=0` and five at `temperature=1.0` (`get_weather(city)`, `max_tokens` 2048-4096)
   all ended right after the closed invoke — `finish_reason: tool_calls`, one parsed call with
   `{"city": "Lisbon"}`, 49-56 `completion_tokens` — and a request without tools was unchanged
   (`finish_reason: stop`, 21 tokens).
+
+- **A missing parameter closer is repaired (`DSML_PARAM_REPAIR=1`, the default).** The rarer
+  form of the same failure: the model leaves out `</|DSML| parameter>` and writes the invented
+  closing tags into the argument (`git status</del></chat></dash></b>`). Without the repair the
+  parser drops that argument in a normal reply (the call comes back as `{}`) and keeps the junk
+  inside it when streaming; an agent would run either. The shim repairs only that structural
+  violation: when a parameter's closer is missing, it strips the trailing run of closing tags
+  that have no matching opening tag inside the value and restores the closer, printing one
+  `DSML PARAM REPAIR` line per repaired call. A value whose closer is present is never touched,
+  whatever it contains (`</div></body></html>`, `</div>\n</section>`). When streaming, each
+  call's arguments are held until that call is complete and then sent in one piece (the call's
+  id and name still arrive first); a valid call's assembled arguments are byte-identical to
+  the parser's. Not repaired: a value cut off with no junk run, junk followed by more text, and
+  requests without tools. Tested on the real parser and tokenizer with 17 synthetic replies
+  built from the shape in issue #15, on all four entry points (`parse`, `extract_tool_calls`,
+  `parse_delta`, `extract_tool_calls_streaming`, token by token): the 9 valid / no-junk /
+  no-tools replies come out identical with the repair on and off, the 8 broken ones come out
+  with the model's real argument. Live on this box with the repair on: 16 tool-call replies (two
+  agent prompts, one and three calls per reply, `temperature` 0 and 1.0, streaming and not) all
+  ended `tool_calls` with valid JSON arguments, and the streamed and non-streamed replies at
+  `temperature=0` were identical. One of them hit the failure for real: the model closed a `bash`
+  `cmd` with a plain `</parameter>` instead of the DSML closer; the repair stripped it and the
+  reply's three calls came back clean (without it that call is `{}`). bench7 with the repair:
+  129.7 ms/step. `DSML_PARAM_REPAIR=0` turns it off.
 
 ## Known limits
 
