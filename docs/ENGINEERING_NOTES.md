@@ -204,3 +204,39 @@ read.
 - **Status/naming:** every speed figure in this repo is single-stream, 512
   tokens, `ignore_eos`, three prompts per class. Prefill figures are
   repeated-text unless labelled otherwise.
+
+## 7. DSML tool calls: parameter repair (issue #15)
+
+(In DSML tags below, `|` stands for U+FF5C, the fullwidth bar the model emits.)
+
+The parser (`vllm.parser.deepseek_v41.DeepSeekV41Parser`) was studied black-box only:
+`inspect.signature()` on its public methods and synthetic DSML through them, never its
+source. Its entry points: `parse` / `extract_tool_calls` / `extract_tool_calls_from_content`
+(whole reply) and `parse_delta` / `extract_tool_calls_streaming` / `finish_streaming`
+(streaming; each returns a `DeltaMessage` or None, and the argument text arrives as JSON
+pieces per tool index, e.g. `{"cmd": "`, `ls -la`, `"}`). The streaming methods do not call the
+whole-reply ones, so each is wrapped separately. With a parameter closer missing and junk
+after the value, the whole-reply path returns the call with `{}` (or, when another parameter
+follows, keeps the junk) and the streaming path streams the junk as part of the argument.
+
+The repair (`_install_dsml_param_repair`, `DSV41_DSML_PARAM_REPAIR=1` by default):
+
+- whole reply: the raw text is repaired before the parser sees it (`_dsml_sanitize`): strip the
+  trailing run of closing tags with no matching opener inside the value, restore the closer;
+- streaming: the parser still gets the raw text and token ids verbatim; the shim holds each
+  call's argument pieces and releases them once that call's invoke has closed or the stream
+  ends. A clean call releases the parser's own pieces, concatenated; a repaired call releases
+  the arguments the whole-reply parser gives for the repaired text of that invoke alone. No
+  piece has to be matched against the raw text, so JSON escaping inside pieces does not matter.
+  The cost is that a call's arguments reach the client at the invoke close instead of
+  piecewise; its id and name arrive as before.
+
+Tested in the image on the real tokenizer, repair off vs on: 17 synthetic replies x 4 entry
+points, streaming fed token by token. All 9 valid, cut-off-without-junk and no-tools replies are
+identical off and on; all 8 form-(b) shapes (junk then invoke close, calls close, the DSML stop
+string, EOS, EOS mid-tag, a second parameter, a broken call before or after a valid one) come
+back with the real argument. On the live server (it streams through
+`extract_tool_calls_streaming`; the shim logs the path once), 16 replies all parsed clean, and one
+was a real occurrence: a `bash` `cmd` closed with a plain `</parameter>`, repaired, with one
+warning line. Earlier, 11 temperature-1.0 replays without the repair had not shown it, so the
+rate is low and prompt-dependent.
