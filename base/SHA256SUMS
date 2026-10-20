@@ -1,0 +1,9 @@
+330d78902b2338272c1677ce3a1a9495d328fdc3c3720f79aaae1945f16e7060  docker/0001-deepseek-v41-reasoning-effort-minimal-medium.patch
+db53e5c9bdee3ecafa017af510a8263dc131bfa67b60f9a2f39efc89b45e1f8b  docker/0002-model-loader-weight-snapshots.patch
+9260c654495b78e2bfaf7e831b1248bb3f81ac7c1f74136487eebc9fe8b562d6  docker/0003-spec-decode-block-residual-mass-lookahead-bound.patch
+df4b252a5d3899c36a5f4823929f5b862e450c01c26b767893fd5903359a737a  docker/0004-spec-decode-block-verification-step-seeds.patch
+ae80d58110bd1344494ea495781302d3c05b5f151d5494122130caa3a9a6e6fc  docker/0005-deepseek-v41-ced-skip-unread-nonfinal-chunks.patch
+dab0e0ef8fa2f176c36972812b34088ccc5718a69c1f5c63db7c7129ddd871a6  docker/0006-deepseek-v41-dspark-no-mtp-hidden-buffer.patch
+cb4ecce2f6e5da6a3efa1ae8f50b8cf213eb0a8c198edac7fda050e6fac5958c  docker/0007-dspark-adaptive-verification-linear-row-cost-budget.patch
+04dfe596fcf6a29ba4e6d03c01eca6aae6dc71fc3c825b72c91377271b72ece1  docker/0008-v1-engine-persistent-prefix-kv-cache.patch
+c733e9b51660a86cff3d1ff01b2b707ab4f407b7fb375166021c4355a536c7f2  docker/Dockerfile

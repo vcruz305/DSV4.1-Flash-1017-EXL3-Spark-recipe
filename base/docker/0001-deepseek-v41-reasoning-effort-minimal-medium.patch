@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:00:00 +0000
+Subject: [PATCH] DeepSeek V4.1: accept reasoning_effort minimal and medium
+
+The OpenAI API's reasoning_effort also takes minimal and medium, which name
+no DeepSeek V4.1 tier, so a request using them failed with a 400. Map them
+to the nearest official tier, minimal -> low (50) and medium -> high (75),
+in REASONING_EFFORT_MAPPINGS, and name them in the renderer's validation
+message. low, high, xhigh (75) and max are unchanged.
+
+Tests: tests/tokenizers_/test_deepseek_v41.py and
+test_deepseek_v41_effort.py render both aliases at their budgets.
+
+License: Apache-2.0 (dsv41-1017 recipe, DeepSeek-V4.1-Flash-1017-4x-DGX-Spark).
+---
+ tests/tokenizers_/test_deepseek_v41.py        |  4 +++-
+ tests/tokenizers_/test_deepseek_v41_effort.py | 10 +++++++++-
+ vllm/tokenizers/deepseek_v41.py               |  3 ++-
+ vllm/tokenizers/deepseek_v41_encoding.py      |  5 +++++
+ 4 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 42117b7b1..d77bc4fdf 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -42,7 +42,9 @@ def test_reference_encoder_fixtures(case_id):
+     ("effort", "budget"),
+     [
+         (None, 75),
++        ("minimal", 50),
+         ("low", 50),
++        ("medium", 75),
+         ("high", 75),
+         ("xhigh", 75),
+         ("max", 100),
+@@ -62,7 +64,7 @@ def test_numeric_reasoning_effort(effort, budget):
+     )
+ 
+ 
+-@pytest.mark.parametrize("effort", ["medium", "minimal", -1, 0, 101, True, 1.5, []])
++@pytest.mark.parametrize("effort", ["Medium", "lowest", -1, 0, 101, True, 1.5, []])
+ def test_invalid_effort_is_a_request_error(effort):
+     with pytest.raises(ValueError, match="reasoning_effort"):
+         render([{"role": "user", "content": "question"}], reasoning_effort=effort)
+diff --git a/tests/tokenizers_/test_deepseek_v41_effort.py b/tests/tokenizers_/test_deepseek_v41_effort.py
+index b9aba4bd9..8e37de939 100644
+--- a/tests/tokenizers_/test_deepseek_v41_effort.py
++++ b/tests/tokenizers_/test_deepseek_v41_effort.py
+@@ -9,7 +9,15 @@ from vllm.tokenizers.deepseek_v41_encoding import render_reasoning_effort
+ 
+ @pytest.mark.parametrize(
+     ("effort", "budget"),
+-    [("low", 50), ("high", 75), ("max", 100), ("xhigh", 75), (None, 75)],
++    [
++        ("minimal", 50),
++        ("low", 50),
++        ("medium", 75),
++        ("high", 75),
++        ("max", 100),
++        ("xhigh", 75),
++        (None, 75),
++    ],
+ )
+ def test_named_and_default_effort_render_configured_numeric_budget(effort, budget):
+     assert render_reasoning_effort(0, "thinking", effort).startswith(
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index c423c3c49..9617b70eb 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -112,7 +112,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
+             ):
+                 raise ValueError(
+-                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "
++                    "DeepSeek V4.1 reasoning_effort must be minimal, low, medium, high, "
++                    "xhigh, max, "
+                     "or an integer within [1, 100] in chat_template_kwargs"
+                 )
+ 
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index b9af8a75e..69e789244 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -236,7 +236,12 @@ REASONING_EFFORT_TEMPLATE = (
+     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+ )
+ REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
++    # OpenAI's minimal and medium name no V4.1 tier; they take the nearest
++    # official one (minimal -> low, medium -> high) so every value the OpenAI
++    # schema accepts renders.
++    "minimal": 50,
+     "low": 50,
++    "medium": 75,
+     "high": 75,
+     # Preserve the accepted alias at its numeric value; the official names
+     # are low, high and max.

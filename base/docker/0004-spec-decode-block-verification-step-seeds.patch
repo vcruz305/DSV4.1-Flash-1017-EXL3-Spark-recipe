@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:30:00 +0000
+Subject: [PATCH] Spec decode: fresh random draws when block verification
+ revisits a position
+
+Block verification draws its acceptance uniform at (request seed, position).
+A draft token past the accepted prefix is not committed, so the next round
+drafts and verifies that position again, and drew the same uniform: the
+rounds were correlated and sampled (temperature > 0) outputs were biased
+(upstream measured P = 0.417 for an expected 0.5 with deterministic drafts,
+the case of a greedy DSpark drafter). The acceptance uniform of draft step i
+now uses spec_step_seed(seed, i), the step mixed into the seed's high bits;
+step 0 keeps the plain seed. Standard verification is unchanged.
+
+Probabilistic drafts cached for verification (gumbel_block_argmax with a
+logits cache, the DFlash2 candidate walk) mix their cache column / step into
+the seed the same way, so a revisited position also gets a fresh draft
+draw. The vocabulary-parallel draft kernel (spec_decode/vocab_parallel.py,
+not in upstream) mixes its cache column too, so it keeps drawing the
+full-vocabulary path's tokens (test_vocab_parallel_draft_matches_full_vocab).
+
+Greedy requests (temperature 0) are unchanged: their acceptance is an
+argmax match that reads no uniform, and all-greedy batches take the greedy
+verification path.
+
+Port of vllm-project/vllm#61161 ("[Bugfix][Spec Decode] Avoid reusing random
+draws across block verification rounds", fixes vllm-project/vllm#61114) by
+DimensionSTP, merged 2026-10-15 as 9edcc7fa7ec858e13d4dc10ed968b741e2c95d6a.
+Adapted to this tree: the watermark kernel here has no draft logits cache,
+so upstream's watermark.py hunk and its test have nothing to apply to; this
+tree has no LiLiCorr, so the candidate walk is DFlash2Speculator's; the
+vocab-parallel hunk is ours. Tests: upstream's
+test_multiround_rejection_sample_is_unbiased and
+test_dspark_revisited_position_uses_step_seed (CUDA).
+
+License: Apache-2.0 (dsv41-1017 recipe, DeepSeek-V4.1-Flash-1017-4x-DGX-Spark).
+---
+ tests/v1/spec_decode/test_dspark_topk.py      | 42 +++++++++++
+ .../test_rejection_sampler_utils.py           | 73 +++++++++++++++++++
+ vllm/v1/worker/gpu/sample/gumbel.py           |  8 ++
+ .../gpu/spec_decode/dflash2/speculator.py     |  4 +-
+ .../spec_decode/rejection_sampler_utils.py    |  9 ++-
+ .../worker/gpu/spec_decode/vocab_parallel.py  |  5 +-
+ 6 files changed, 135 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_dspark_topk.py b/tests/v1/spec_decode/test_dspark_topk.py
+index 2de1ff052..164ef14ff 100644
+--- a/tests/v1/spec_decode/test_dspark_topk.py
++++ b/tests/v1/spec_decode/test_dspark_topk.py
+@@ -15,6 +15,8 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import
+ )
+ from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+ from vllm.platforms import current_platform
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+ 
+ 
+ def _markov_head(weight: torch.Tensor) -> DSparkMarkovHead:
+@@ -70,6 +72,46 @@ def test_gathered_markov_bias_matches_dense_at_full_vocab():
+     torch.testing.assert_close(result, expected)
+ 
+ 
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("use_fp64", [False, True])
++def test_dspark_revisited_position_uses_step_seed(use_fp64):
++    """A cached draft at a revisited position must use its current step."""
++    device = torch.device("cuda")
++    batch = 4096
++    spec = DSparkSpeculator.__new__(DSparkSpeculator)
++    spec.acceptance_estimator = None
++    spec._d2t_scatter_index = None
++    spec.draft_watermarker = None
++    spec.use_fp64_gumbel = use_fp64
++    spec.temperature = torch.ones(batch, device=device)
++    spec.seeds = torch.arange(batch, dtype=torch.int64, device=device)
++    spec._step_cols = torch.arange(2, dtype=torch.int32, device=device)
++    spec.draft_logits = torch.empty(batch, 2, 2, device=device)
++    logits = torch.tensor([0.7, 0.3], device=device).log().expand(batch, -1)
++    mapping = torch.arange(batch, device=device)
++    positions = torch.full((batch,), 22, dtype=torch.int64, device=device)
++
++    first = spec._sample_logits(logits, mapping, positions, 1)
++    repeated = spec._sample_logits(logits, mapping, positions, 1)
++    next_round = spec._sample_logits(logits, mapping, positions, 0)
++    torch.testing.assert_close(first, repeated)
++    expected = gumbel_sample(
++        logits,
++        mapping,
++        spec.temperature,
++        spec.seeds,
++        positions - 1,
++        apply_temperature=True,
++        is_drafting=True,
++        logits_cache=spec.draft_logits,
++        logits_cache_col=spec._step_cols[0],
++        use_fp64=use_fp64,
++    )
++    torch.testing.assert_close(next_round, expected)
++    mismatch_rate = (first != next_round).float().mean().item()
++    assert 0.35 < mismatch_rate < 0.5
++
++
+ @pytest.mark.parametrize("cuda_alike_platform", [False, True])
+ def test_gathered_markov_bias_dequantizes_selected_w4a16_rows(
+     monkeypatch, cuda_alike_platform
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index 0dc3c2965..8c1034da8 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -386,6 +386,79 @@ def test_gumbel_drafted_rejection_sample_is_unbiased(
+         )
+ 
+ 
++@pytest.mark.parametrize("use_block_verification", [False, True])
++@pytest.mark.parametrize("probabilistic_draft", [False, True])
++def test_multiround_rejection_sample_is_unbiased(
++    use_block_verification: bool, probabilistic_draft: bool
++):
++    """Uncommitted positions must receive fresh noise on later verification rounds."""
++    torch.manual_seed(42)
++    num_trials, num_tokens, k = 32768, 6, 2
++    device = "cuda"
++    target_probs = torch.tensor(
++        [0.3, 0.7] if probabilistic_draft else [0.5, 0.5], device=device
++    )
++    draft_logits = torch.tensor(
++        [0.7, 0.3] if probabilistic_draft else [1.0, 0.0], device=device
++    ).log()
++    inputs = _build_rejection_sample_inputs(
++        target_probs.log(), draft_logits, k, 1.0, num_trials
++    )
++    seeds = inputs["seed"]
++    output = torch.full((num_trials, num_tokens + k), -1, device=device)
++    output[:, 0] = torch.multinomial(target_probs, num_trials, replacement=True)
++    lengths = torch.ones(num_trials, dtype=torch.int64, device=device)
++    accepted = 0
++    while (lengths < num_tokens).any():
++        active = (lengths < num_tokens).nonzero().flatten()
++        n = active.numel()
++        starts = lengths[active]
++        local_positions = torch.arange(k + 1, device=device).repeat(n)
++        positions = (starts[:, None] + torch.arange(k + 1, device=device)).flatten()
++        draft_sampled = torch.zeros((n, k + 1), dtype=torch.int64, device=device)
++        draft_sampled[:, 0] = output[active, starts - 1]
++        logits_cache = inputs["draft_logits"] if probabilistic_draft else None
++        if probabilistic_draft:
++            for step in range(k):
++                draft_sampled[:, step + 1] = gumbel_sample(
++                    draft_logits.expand(n, -1),
++                    active,
++                    inputs["temperature"],
++                    seeds,
++                    starts + step,
++                    apply_temperature=True,
++                    is_drafting=True,
++                    logits_cache=logits_cache,
++                    logits_cache_col=torch.tensor(step, device=device),
++                )
++        sampled, counts = rejection_sample(
++            target_logits=target_probs.log().expand(n * (k + 1), -1).contiguous(),
++            draft_logits=logits_cache,
++            draft_sampled=draft_sampled.flatten(),
++            cu_num_logits=torch.arange(n + 1, dtype=torch.int32, device=device)
++            * (k + 1),
++            pos=positions,
++            idx_mapping=active,
++            expanded_idx_mapping=active.repeat_interleave(k + 1),
++            expanded_local_pos=local_positions,
++            temperature=inputs["temperature"],
++            seed=seeds,
++            num_speculative_steps=k,
++            use_block_verification=use_block_verification,
++        )
++        for column in range(k + 1):
++            valid = counts > column
++            output[active[valid], starts[valid] + column] = sampled[valid, column]
++        lengths[active] += counts
++        accepted += (counts - 1).sum().item()
++
++    assert accepted > num_trials, "The test must exercise accepted draft tokens."
++    for position in range(num_tokens):
++        _assert_distribution_match(
++            output[:, position], target_probs, device, label=f"position {position}"
++        )
++
++
+ @pytest.mark.parametrize("num_speculative_steps", [1, 3])
+ def test_greedy_rejection_sample(num_speculative_steps: int):
+     """
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index 5c065c10c..1d3ea32ae 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -118,6 +118,12 @@ def tl_rand32(seed, offset, includes_zero: tl.constexpr):
+     return u
+ 
+ 
++@triton.jit
++def spec_step_seed(seed, step):
++    """Mix a speculative step into the high bits of a request seed."""
++    return seed ^ (tl.cast(step, tl.int64) << 32)
++
++
+ @triton.jit
+ def gumbel_noised_argmax(
+     logits,
+@@ -207,6 +213,8 @@ def gumbel_block_argmax(
+ 
+     seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+     pos = tl.load(pos_ptr + token_idx)
++    if logits_cache_ptr is not None:
++        seed = spec_step_seed(seed, col)
+     return gumbel_noised_argmax(
+         logits,
+         block,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 7db528449..d532c623e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -8,7 +8,7 @@ import torch
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.triton_utils import tl, triton
+-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ 
+ 
+@@ -58,7 +58,7 @@ def _selector_walk_kernel(
+             scores,
+             candidates,
+             mask & valid,
+-            seed,
++            spec_step_seed(seed, step),
+             sample_pos,
+             temperature if SAMPLE_PROBABILISTIC else 0.0,
+             IS_DRAFTING=True,
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 9ed13d9cd..3a3a30f93 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -11,7 +11,11 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     triton_warmup_inputs,
+ )
+ from vllm.triton_utils import tl, tldevice, triton
+-from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
++from vllm.v1.worker.gpu.sample.gumbel import (
++    gumbel_block_argmax,
++    spec_step_seed,
++    tl_rand32,
++)
+ from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
+ 
+ 
+@@ -583,7 +587,8 @@ def _rejection_kernel(
+ 
+         if verifying:
+             pos = tl.load(pos_ptr + logit_idx)
+-            u = tl_rand32(seed, pos, includes_zero=False)
++            step_seed = spec_step_seed(seed, i) if USE_BLOCK_VERIFICATION else seed
++            u = tl_rand32(step_seed, pos, includes_zero=False)
+             if is_greedy:
+                 # Greedy sampling. Accept IFF draft matches target argmax.
+                 # NOTE: Target argmax is stored directly so that resampling
+diff --git a/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py b/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py
+index db0fbc14c..6212cacce 100644
+--- a/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py
++++ b/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py
+@@ -25,7 +25,7 @@ from __future__ import annotations
+ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
+ 
+ BLOCK = 1024
+ 
+@@ -103,7 +103,8 @@ def _vp_draft_block_kernel(
+         logits,
+         mask=mask & valid,
+     )
+-    seed = tl.load(seeds_ptr + req, mask=valid, other=0)
++    # The cached draft's step seed, as gumbel_block_argmax uses for the full vocab.
++    seed = spec_step_seed(tl.load(seeds_ptr + req, mask=valid, other=0), col)
+     pos = tl.load(pos_ptr + row)
+     keys = vocab_start + offs
+     value, idx = gumbel_noised_argmax(

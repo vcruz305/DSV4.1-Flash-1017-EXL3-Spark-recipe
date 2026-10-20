@@ -1,0 +1,1665 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 12:00:00 +0000
+Subject: [PATCH] Model loader: per-rank snapshots of loaded weights
+
+With DSV41_WEIGHT_SNAPSHOT=1, BaseModelLoader.load_model restores the
+target model's loaded weights from a per-rank snapshot instead of reading
+the checkpoint, and writes one when it has to read the checkpoint.
+
+A snapshot holds the state right after load_weights, before
+process_weights_after_loading: every storage behind the model's parameters
+and buffers, 4 KiB aligned in one data file, with a manifest (tensor
+layout, a CRC32 per 64 MiB chunk, the plain-data attributes load_weights
+set, such as disk Engram's file references) and a COMPLETE marker holding
+the manifest's SHA-256. A restore builds the model as usual, checks the
+layout and replay preconditions, reads the file with O_DIRECT through four
+pinned 64 MiB slots into the storages in place, replays the attributes,
+and then runs the usual post-processing, which therefore sees bit-identical
+inputs and rebuilds every derived tensor, kernel argument and plain
+attribute itself. Nothing post-processing produces is ever restored, so
+value-dependent processing (the packed BF16 head's exponent base and
+exception count, the scaled indexer projection, the MoE repack's K tails)
+needs no special handling.
+
+The key covers the checkpoint (shard sizes, mtimes and safetensors headers,
+JSON contents), the rank, the vLLM and B12X Python sources, Torch and the
+device, VllmConfig.compute_hash() and the resolved HF config, the load
+format, the engine environment (VLLM_*, SPARK3_*, B12X_*, DSV41_*,
+SAFETENSORS_*, without secrets and ports) and DSV41_WEIGHT_SNAPSHOT_TAG.
+Every rank must hold a valid snapshot or every rank loads the checkpoint
+(a CPU-group all-reduce); a read or CRC failure on any rank discards that
+snapshot and sends every rank to the checkpoint. A snapshot is written only
+if load_weights replaced no parameter, buffer or submodule and changed no
+attribute other than plain data and parameter-backed tensors. Draft models,
+loaders other than DefaultModelLoader's family and online-quantized models
+always load the checkpoint. Snapshots live under DSV41_WEIGHT_SNAPSHOT_DIR
+(default /cache/dsv41/weight-snapshots), DSV41_WEIGHT_SNAPSHOT_KEEP per rank
+(default 1). DSV41_WEIGHT_SNAPSHOT_DIGEST=1 writes per-tensor CRC32 digests
+of the processed model (parameters, buffers, attribute tensors) for
+comparing a restored boot with a checkpoint boot.
+
+The idea of a per-rank processed-weight snapshot comes from
+kindlingai/glm-5.3-flash-gx10 (no code taken).
+
+Tests: tests/model_executor/model_loader/test_weight_snapshot.py (CPU).
+
+License: Apache-2.0 (dsv41-1017 recipe, DeepSeek-V4.1-Flash-1017-4x-DGX-Spark).
+---
+ .../model_loader/test_weight_snapshot.py      |  237 +++
+ .../model_loader/base_loader.py               |   11 +-
+ .../model_loader/weight_snapshot.py           | 1318 +++++++++++++++++
+ 3 files changed, 1565 insertions(+), 1 deletion(-)
+ create mode 100644 tests/model_executor/model_loader/test_weight_snapshot.py
+ create mode 100644 vllm/model_executor/model_loader/weight_snapshot.py
+
+diff --git a/tests/model_executor/model_loader/test_weight_snapshot.py b/tests/model_executor/model_loader/test_weight_snapshot.py
+new file mode 100644
+index 000000000..326df7838
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_weight_snapshot.py
+@@ -0,0 +1,237 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU tests of the per-rank weight snapshot: layout, chunking, replay, CRC,
++and the load-side-effect guard."""
++
++import pytest
++import torch
++from torch import nn
++
++from vllm.model_executor.model_loader import weight_snapshot as ws
++
++
++class _Helper:
++    """A plain object holding a tensor, as kernel wrappers do."""
++
++    def __init__(self, tensor: torch.Tensor):
++        self.tensor = tensor
++
++
++class _Table(nn.Module):
++    def __init__(self):
++        super().__init__()
++        # Disk-backed table: only file references are recorded at load.
++        self._disk_sources: list[tuple[str, int, bool]] = []
++        self.packed = nn.Parameter(
++            torch.zeros(4097, dtype=torch.uint8), requires_grad=False
++        )
++
++
++class _Block(nn.Module):
++    def __init__(self, shared: nn.Parameter):
++        super().__init__()
++        base = torch.zeros(24, 40, dtype=torch.bfloat16)
++        # Non-contiguous parameter over a larger storage.
++        self.weight_t = nn.Parameter(base.t(), requires_grad=False)
++        # Two parameters viewing one storage.
++        fused = torch.zeros(10, 8)
++        self.first = nn.Parameter(fused[:4], requires_grad=False)
++        self.second = nn.Parameter(fused[4:], requires_grad=False)
++        self.shared = shared
++        self.register_buffer("scale", torch.ones(3, dtype=torch.float64))
++        self.register_buffer("steps", torch.arange(5), persistent=False)
++        # Plain attributes: an alias of a parameter and a helper object.
++        self.alias = self.first.data
++        self.helper = _Helper(self.second.data[1:])
++        self.flag = "initial"
++
++
++class _Model(nn.Module):
++    def __init__(self, width: int = 16):
++        super().__init__()
++        self.embed = nn.Parameter(torch.zeros(width, 33), requires_grad=False)
++        self.blocks = nn.ModuleList([_Block(self.embed) for _ in range(3)])
++        self.table = _Table()
++        self.big = nn.Parameter(
++            torch.zeros(3 * 4096 + 17, dtype=torch.float16), requires_grad=False
++        )
++        self.ghost = nn.Parameter(torch.empty(7, 3, device="meta"), requires_grad=False)
++
++
++def _load(model: _Model, seed: int) -> None:
++    """A load: tensor contents (through .copy_ and .data) and plain-data records."""
++    generator = torch.Generator().manual_seed(seed)
++    for name, param in model.named_parameters():
++        if param.device.type == "meta":
++            continue
++        values = torch.randint(
++            0, 255, param.shape, generator=generator, dtype=torch.uint8
++        )
++        if name.endswith("big"):
++            param.data.copy_(values.to(param.dtype))
++        else:
++            param.copy_(values.to(param.dtype))
++    model.table._disk_sources.append(
++        ("/models/model-00047-of-00048.safetensors", 4096, False)
++    )
++    model.table._disk_sources.append(
++        ("/models/model-00048-of-00048.safetensors", 8192, True)
++    )
++
++
++def _state(model: nn.Module) -> dict[str, torch.Tensor]:
++    out = {}
++    for name, tensor in [
++        *model.named_parameters(remove_duplicate=False),
++        *model.named_buffers(remove_duplicate=False),
++    ]:
++        if tensor.device.type != "meta":
++            out[name] = tensor.detach().contiguous().view(-1).view(torch.uint8).clone()
++    return out
++
++
++@pytest.fixture(autouse=True)
++def small_chunks(monkeypatch):
++    # Small chunks so storages straddle chunk boundaries.
++    monkeypatch.setattr(ws, "_CHUNK", 8192)
++
++
++def _store(tmp_path, key="k" * 64, factors=None):
++    return ws.SnapshotStore(
++        tmp_path, "rank00of01", key, factors or {"tag": "a"}, direct=False
++    )
++
++
++def _write(tmp_path, model, seed=1, **kwargs):
++    probe = ws.LoadProbe(model)
++    _load(model, seed)
++    owned = {ws._storage_key_of(s) for s in ws._layout(model).storages}
++    replay, problems = probe.changes(model, owned)
++    assert problems == []
++    store = _store(tmp_path, **kwargs)
++    store.write(model, replay)
++    return store, replay
++
++
++def test_round_trip_restores_every_storage_and_replays(tmp_path):
++    source = _Model()
++    store, replay = _write(tmp_path, source)
++    assert [op["attr"] for op in replay] == ["_disk_sources"]
++    assert (store.path / ws.COMPLETE_FILE).is_file()
++    assert (store.path / ws.DATA_FILE).stat().st_size % 4096 == 0
++
++    target = _Model()
++    torch.manual_seed(5)
++    for param in target.parameters():
++        if param.device.type != "meta":
++            param.data.copy_(torch.randn(param.shape).to(param.dtype))
++    sources = target.table._disk_sources
++    reader = _store(tmp_path)
++    layout = reader.check(target)
++    reader.restore(target, layout)
++
++    expected, actual = _state(source), _state(target)
++    assert expected.keys() == actual.keys()
++    for name in expected:
++        assert torch.equal(expected[name], actual[name]), name
++    assert target.table._disk_sources is sources
++    assert sources == source.table._disk_sources
++    assert isinstance(sources[0], tuple)
++    # Views and plain-attribute aliases see the restored storage.
++    assert torch.equal(target.blocks[0].alias, target.blocks[0].first)
++    assert torch.equal(target.blocks[1].helper.tensor, target.blocks[1].second[1:])
++    assert target.blocks[2].shared is target.embed
++    assert ws.digest_model(source)["summary"] == ws.digest_model(target)["summary"]
++
++
++def test_layout_mismatch_is_refused(tmp_path):
++    _write(tmp_path, _Model())
++    with pytest.raises(ws.SnapshotUnusable, match="layout differs"):
++        _store(tmp_path).check(_Model(width=17))
++
++
++def test_missing_snapshot_names_differing_key_factors(tmp_path):
++    _write(tmp_path, _Model(), key="a" * 64, factors={"env": {"X": "1"}, "tag": "t"})
++    other = _store(tmp_path, key="b" * 64, factors={"env": {"X": "2"}, "tag": "t"})
++    with pytest.raises(ws.SnapshotUnusable, match=r"differs in env\.X"):
++        other.check(_Model())
++
++
++def test_corrupt_chunk_is_detected(tmp_path):
++    store, _ = _write(tmp_path, _Model())
++    with open(store.path / ws.DATA_FILE, "r+b") as handle:
++        handle.seek(9000)
++        byte = handle.read(1)
++        handle.seek(9000)
++        handle.write(bytes([byte[0] ^ 0xFF]))
++    target = _Model()
++    reader = _store(tmp_path)
++    with pytest.raises(ws.SnapshotUnusable, match="CRC32"):
++        reader.restore(target, reader.check(target))
++
++
++def test_tampered_manifest_is_refused(tmp_path):
++    store, _ = _write(tmp_path, _Model())
++    manifest = store.path / ws.MANIFEST_FILE
++    manifest.write_bytes(manifest.read_bytes().replace(b'"replay"', b'"replay" '))
++    with pytest.raises(ws.SnapshotUnusable, match="COMPLETE"):
++        _store(tmp_path).check(_Model())
++
++
++def test_replay_precondition(tmp_path):
++    _write(tmp_path, _Model())
++    target = _Model()
++    target.table._disk_sources.append(("/elsewhere", 0, False))
++    with pytest.raises(ws.SnapshotUnusable, match="does not start where"):
++        _store(tmp_path).check(target)
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        lambda m: setattr(m.blocks[0], "first", nn.Parameter(torch.ones(4, 8))),
++        lambda m: m.blocks[1].register_buffer("extra", torch.ones(2)),
++        lambda m: setattr(m.blocks[2], "helper", _Helper(torch.ones(1))),
++        lambda m: setattr(m.blocks[2], "flag", object()),
++        lambda m: setattr(m, "cache", torch.ones(2)),
++    ],
++    ids=["replaced-param", "new-buffer", "new-object", "object-attr", "new-tensor"],
++)
++def test_unreplayable_load_side_effects_block_the_write(mutate):
++    model = _Model()
++    probe = ws.LoadProbe(model)
++    _load(model, 1)
++    mutate(model)
++    owned = {ws._storage_key_of(s) for s in ws._layout(model).storages}
++    _, problems = probe.changes(model, owned)
++    assert problems
++
++
++def test_plain_tensor_written_outside_parameters_blocks_the_write():
++    model = _Model()
++    model.blocks[0].workspace = torch.zeros(4)
++    probe = ws.LoadProbe(model)
++    _load(model, 1)
++    model.blocks[0].workspace.add_(1)
++    owned = {ws._storage_key_of(s) for s in ws._layout(model).storages}
++    _, problems = probe.changes(model, owned)
++    assert any("workspace" in p for p in problems)
++
++
++def test_overlapping_storages_are_refused():
++    model = _Model()
++    blob = torch.zeros(64, dtype=torch.uint8)
++    # A second storage over part of the first's memory, as a raw-pointer alias
++    # would be (identical spans are one storage; partial overlap is refused).
++    alias = torch.frombuffer(blob[8:].numpy(), dtype=torch.uint8)
++    model.a = nn.Parameter(blob[:32], requires_grad=False)
++    model.b = nn.Parameter(alias[16:], requires_grad=False)
++    with pytest.raises(ws.SnapshotUnusable, match="overlap"):
++        ws._layout(model)
++
++
++def test_plain_data_encoding_round_trips():
++    value = [("p", 1, True), {"k": [1.5, None, "s"]}, (), []]
++    assert ws._decode(ws._encode(value)) == value
++    with pytest.raises(ws._NotData):
++        ws._encode(torch.float32)
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 5b4a3d961..860591b6d 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.utils import (
+     initialize_model,
+     process_weights_after_loading,
+ )
++from vllm.model_executor.model_loader.weight_snapshot import WeightSnapshot
+ from vllm.platforms import current_platform
+ from vllm.tracing import instrument
+ from vllm.utils.mem_utils import format_gib
+@@ -63,6 +64,9 @@ class BaseModelLoader(ABC):
+             device_config.device if load_config.device is None else load_config.device
+         )
+         target_device = torch.device(load_device)
++        # DSV41_WEIGHT_SNAPSHOT: the target model's loaded weights from a per-rank
++        # snapshot instead of the checkpoint (None unless enabled and applicable).
++        snapshot = WeightSnapshot.for_load(self, vllm_config, model_config)
+         with set_default_torch_dtype(model_config.dtype):
+             with target_device:
+                 model = self.create_model(
+@@ -72,7 +76,10 @@ class BaseModelLoader(ABC):
+                 )
+ 
+             logger.debug("Loading weights on %s ...", load_device)
+-            self.load_weights(model, model_config)
++            if snapshot is None:
++                self.load_weights(model, model_config)
++            else:
++                snapshot.load_weights(self, model)
+ 
+             # Log peak GPU memory after loading weights. This is needed
+             # to have test coverage on peak memory for online quantization.
+@@ -89,6 +96,8 @@ class BaseModelLoader(ABC):
+                 finalize_layerwise_processing(model, model_config)
+ 
+             process_weights_after_loading(model, model_config, target_device)
++            if snapshot is not None:
++                snapshot.after_processing(model)
+ 
+         return model.eval()
+ 
+diff --git a/vllm/model_executor/model_loader/weight_snapshot.py b/vllm/model_executor/model_loader/weight_snapshot.py
+new file mode 100644
+index 000000000..c857cfef0
+--- /dev/null
++++ b/vllm/model_executor/model_loader/weight_snapshot.py
+@@ -0,0 +1,1318 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-rank snapshots of loaded weights, restored with large O_DIRECT reads.
++
++With ``DSV41_WEIGHT_SNAPSHOT=1`` the target model's weights are captured on the
++first boot right after ``load_weights`` and before
++``process_weights_after_loading``: every storage behind the model's parameters
++and buffers goes, 4 KiB aligned, into one data file per rank, with a manifest
++(the tensor layout, the per-chunk CRC32s and the load's replayable side
++effects) and a COMPLETE marker. A later boot with the same key builds the model
++as usual, overwrites those storages in place from the snapshot instead of
++reading the checkpoint, and then runs the usual post-processing on the
++restored values. Post-processing therefore sees bit-identical inputs and
++rebuilds every derived tensor, kernel argument and plain attribute itself;
++nothing it produces is ever restored.
++
++The key covers the checkpoint (sizes, mtimes and safetensors headers of its
++shards, contents of its JSON files), this rank's place in the world, the vLLM
++and B12X Python sources, Torch and the device, the engine configuration hash
++and the engine environment (``VLLM_*``, ``SPARK3_*``, ``B12X_*``, ``DSV41_*``,
++``SAFETENSORS_*``). Every rank must hold a valid snapshot whose layout matches
++the freshly built model, or every rank loads the checkpoint; a read or CRC
++failure on any rank also sends every rank to the checkpoint. A snapshot is
++written only when ``load_weights`` changed nothing but tensor contents and
++plain-data attributes (which are replayed), so a load with other side effects
++is never short-cut.
++
++Environment:
++    DSV41_WEIGHT_SNAPSHOT         1 enables restore and write (default 0)
++    DSV41_WEIGHT_SNAPSHOT_DIR     root directory (default
++                                  /cache/dsv41/weight-snapshots)
++    DSV41_WEIGHT_SNAPSHOT_TAG     free-form string in the key; change it to
++                                  invalidate every snapshot
++    DSV41_WEIGHT_SNAPSHOT_KEEP    snapshots kept per rank, newest first
++                                  (default 1)
++    DSV41_WEIGHT_SNAPSHOT_VERIFY  0 skips the CRC32 check of restored chunks
++                                  (default 1)
++    DSV41_WEIGHT_SNAPSHOT_DIGEST  1 writes per-tensor CRC32 digests of the
++                                  processed model (parameters, buffers and
++                                  tensors held in plain attributes) to
++                                  DIR/digests and logs a summary, with or
++                                  without snapshots; for verification only
++"""
++
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import os
++import shutil
++import time
++import zlib
++from collections.abc import Callable, Iterator
++from concurrent.futures import Future, ThreadPoolExecutor
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import torch
++from torch import nn
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV_ENABLE = "DSV41_WEIGHT_SNAPSHOT"
++ENV_DIR = "DSV41_WEIGHT_SNAPSHOT_DIR"
++ENV_TAG = "DSV41_WEIGHT_SNAPSHOT_TAG"
++ENV_KEEP = "DSV41_WEIGHT_SNAPSHOT_KEEP"
++ENV_VERIFY = "DSV41_WEIGHT_SNAPSHOT_VERIFY"
++ENV_DIGEST = "DSV41_WEIGHT_SNAPSHOT_DIGEST"
++DEFAULT_DIR = "/cache/dsv41/weight-snapshots"
++
++FORMAT = "dsv41-weight-snapshot/1"
++DATA_FILE = "weights.bin"
++MANIFEST_FILE = "manifest.json"
++COMPLETE_FILE = "COMPLETE"
++
++_ALIGN = 4096
++_CHUNK = 64 << 20
++_SLOTS = 4
++# Free space left on the cache filesystem after a snapshot is written.
++_SPACE_MARGIN = 4 << 30
++_O_DIRECT = getattr(os, "O_DIRECT", 0)
++_ENV_PREFIXES = ("VLLM_", "SPARK3_", "B12X_", "DSV41_", "SAFETENSORS_")
++# Names with these words (split on "_") are per-boot, per-request or secret
++# values that do not shape the weights.
++_ENV_EXCLUDED = frozenset(
++    {"KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PORT", "RPC", "INSTANCE"}
++)
++_MODULE_KEYS = ("_parameters", "_buffers", "_modules")
++_MISSING = object()
++
++
++class SnapshotUnusable(Exception):
++    """The snapshot does not fit this boot; load the checkpoint instead."""
++
++
++class _NotData(Exception):
++    pass
++
++
++def _env_flag(name: str, default: str = "0") -> bool:
++    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
++
++
++def _align(n: int) -> int:
++    return -(-n // _ALIGN) * _ALIGN
++
++
++def _gib(n: int) -> float:
++    return n / (1 << 30)
++
++
++# ── plain data: the load side effects a snapshot can replay ─────────────────────
++
++
++def _encode(value: Any, depth: int = 0) -> Any:
++    """JSON form of plain data (None, bool, int, float, str, and lists, tuples
++    and str-keyed dicts of them); raises _NotData for anything else."""
++    if depth > 16:
++        raise _NotData
++    if value is None:
++        return None
++    # Exact types only: an enum or other subclass is not replayable as data.
++    if type(value) is bool:
++        return {"b": value}
++    if type(value) is int:
++        return {"i": value}
++    if type(value) is float:
++        return {"f": repr(value)}
++    if type(value) is str:
++        return {"s": value}
++    if type(value) in (list, tuple):
++        tag = "l" if type(value) is list else "t"
++        return {tag: [_encode(item, depth + 1) for item in value]}
++    if type(value) is dict and all(isinstance(k, str) for k in value):
++        return {"d": [[k, _encode(v, depth + 1)] for k, v in value.items()]}
++    raise _NotData
++
++
++def _decode(data: Any) -> Any:
++    if data is None:
++        return None
++    ((tag, value),) = data.items()
++    if tag == "b":
++        return bool(value)
++    if tag == "i":
++        return int(value)
++    if tag == "f":
++        return float(value)
++    if tag == "s":
++        return str(value)
++    if tag == "l":
++        return [_decode(item) for item in value]
++    if tag == "t":
++        return tuple(_decode(item) for item in value)
++    if tag == "d":
++        return {k: _decode(v) for k, v in value}
++    raise ValueError(f"unknown plain-data tag {tag!r}")
++
++
++def _encode_attr(module: nn.Module, name: str) -> Any:
++    value = module.__dict__.get(name, _MISSING)
++    return {"missing": True} if value is _MISSING else _encode(value)
++
++
++# ── the model's tensor layout ───────────────────────────────────────────────────
++
++
++def _storage_key(tensor: torch.Tensor) -> tuple[str, int, int]:
++    storage = tensor.untyped_storage()
++    return str(tensor.device), storage.data_ptr(), storage.nbytes()
++
++
++@dataclass
++class _Layout:
++    tensors: list[dict[str, Any]]
++    storages: list[torch.UntypedStorage]
++    sizes: list[int]
++    offsets: list[int]
++    data_bytes: int
++
++    def signature(self) -> list[Any]:
++        devices = [str(s.device.type) for s in self.storages]
++        return [self.tensors, list(zip(devices, self.sizes)), self.data_bytes]
++
++
++def _layout(model: nn.Module) -> _Layout:
++    """Every parameter and buffer, with the storages behind them in order of
++    first use; views and shared tensors map to one storage."""
++    tensors: list[dict[str, Any]] = []
++    storages: list[torch.UntypedStorage] = []
++    index: dict[tuple[str, int, int], int] = {}
++    named = [
++        ("param", model.named_parameters(remove_duplicate=False)),
++        ("buffer", model.named_buffers(remove_duplicate=False)),
++    ]
++    for kind, items in named:
++        for name, tensor in items:
++            storage_index = -1
++            try:
++                storage = tensor.untyped_storage()
++            except (RuntimeError, NotImplementedError) as exc:
++                raise SnapshotUnusable(f"{name} has no plain storage: {exc}") from exc
++            if tensor.device.type != "meta" and storage.nbytes():
++                if tensor.device.type not in ("cuda", "cpu"):
++                    raise SnapshotUnusable(f"{name} lives on {tensor.device}")
++                key = _storage_key(tensor)
++                storage_index = index.setdefault(key, len(storages))
++                if storage_index == len(storages):
++                    storages.append(storage)
++            tensors.append(
++                {
++                    "name": name,
++                    "kind": kind,
++                    "dtype": str(tensor.dtype),
++                    "shape": list(tensor.shape),
++                    "stride": list(tensor.stride()),
++                    "offset": tensor.storage_offset(),
++                    "device": tensor.device.type,
++                    "storage": storage_index,
++                }
++            )
++    # Distinct storages must not share memory: each is written whole.
++    spans = sorted(
++        (str(s.device), s.data_ptr(), s.data_ptr() + s.nbytes()) for s in storages
++    )
++    for (dev_a, _, end_a), (dev_b, start_b, _) in zip(spans, spans[1:]):
++        if dev_a == dev_b and start_b < end_a:
++            raise SnapshotUnusable("two parameter storages overlap in memory")
++    sizes = [s.nbytes() for s in storages]
++    offsets, position = [], 0
++    for size in sizes:
++        offsets.append(position)
++        position += _align(size)
++    return _Layout(tensors, storages, sizes, offsets, position)
++
++
++def _bytes(storage: torch.UntypedStorage) -> torch.Tensor:
++    view = torch.empty(0, dtype=torch.uint8, device=storage.device)
++    return view.set_(storage, 0, (storage.nbytes(),), (1,))
++
++
++@dataclass
++class _Chunk:
++    offset: int
++    length: int
++    # (storage index, offset in storage, offset in chunk, bytes)
++    segments: list[tuple[int, int, int, int]]
++
++
++def _chunks(layout: _Layout) -> list[_Chunk]:
++    """The data file in _CHUNK pieces, each with the storage segments it holds."""
++    chunk = _CHUNK
++    result: list[_Chunk] = []
++    first = 0
++    count = len(layout.sizes)
++    for start in range(0, layout.data_bytes, chunk):
++        end = min(start + chunk, layout.data_bytes)
++        while first < count and layout.offsets[first] + layout.sizes[first] <= start:
++            first += 1
++        segments = []
++        index = first
++        while index < count and layout.offsets[index] < end:
++            low = max(start, layout.offsets[index])
++            high = min(end, layout.offsets[index] + layout.sizes[index])
++            if high > low:
++                segments.append(
++                    (index, low - layout.offsets[index], low - start, high - low)
++                )
++            index += 1
++        result.append(_Chunk(start, end - start, segments))
++    return result
++
++
++# ── side effects of load_weights ────────────────────────────────────────────────
++
++
++def _tensor_state(tensor: torch.Tensor) -> tuple[Any, ...]:
++    try:
++        version: int | None = tensor._version
++    except RuntimeError:  # inference tensors carry no version counter
++        version = None
++    key = _storage_key(tensor) if tensor.device.type != "meta" else None
++    return ("tensor", id(tensor), version, key)
++
++
++def _attr_state(value: Any, depth: int = 0) -> tuple[Any, ...]:
++    try:
++        return ("data", json.dumps(_encode(value)))
++    except _NotData:
++        pass
++    if isinstance(value, torch.Tensor):
++        return _tensor_state(value)
++    if isinstance(value, nn.Module):
++        return ("module", id(value))
++    if isinstance(value, (list, tuple)) and depth < 3:
++        return (
++            "seq",
++            type(value).__name__,
++            id(value),
++            tuple(_attr_state(item, depth + 1) for item in value),
++        )
++    if isinstance(value, dict) and depth < 3:
++        return (
++            "map",
++            id(value),
++            tuple((repr(k), _attr_state(v, depth + 1)) for k, v in value.items()),
++        )
++    return ("object", id(value))
++
++
++def _owned_tensor(tensor: torch.Tensor) -> tuple[Any, ...] | None:
++    if tensor.device.type == "meta":
++        return (id(tensor), "meta", str(tensor.dtype), tuple(tensor.shape))
++    return (
++        id(tensor),
++        _storage_key(tensor),
++        str(tensor.dtype),
++        tuple(tensor.shape),
++        tuple(tensor.stride()),
++        tensor.storage_offset(),
++    )
++
++
++class LoadProbe:
++    """The Python-level state of every module, taken before and after
++    load_weights: parameters, buffers and submodules by identity and layout, and
++    every other attribute as plain data, tensor identity and version, or object
++    identity."""
++
++    def __init__(self, model: nn.Module):
++        self.modules: dict[str, tuple[Any, ...]] = {}
++        for name, module in model.named_modules(remove_duplicate=False):
++            state = module.__dict__
++            self.modules[name] = (
++                {
++                    k: v if v is None else _owned_tensor(v)
++                    for k, v in state["_parameters"].items()
++                },
++                {
++                    k: v if v is None else _owned_tensor(v)
++                    for k, v in state["_buffers"].items()
++                },
++                {k: None if v is None else id(v) for k, v in state["_modules"].items()},
++                {k: _attr_state(v) for k, v in state.items() if k not in _MODULE_KEYS},
++            )
++
++    def changes(
++        self, model: nn.Module, owned: set[tuple[str, int, int]]
++    ) -> tuple[list[dict[str, Any]], list[str]]:
++        """What load_weights changed besides tensor contents: plain-data attribute
++        changes to replay, and the changes no snapshot can stand in for. A plain
++        tensor may be written in place only through a parameter or buffer
++        storage (``owned``)."""
++        after = LoadProbe(model)
++        replay: list[dict[str, Any]] = []
++        problems: list[str] = []
++        if after.modules.keys() != self.modules.keys():
++            problems.append("the module tree changed")
++            return replay, problems
++        for name, (params, buffers, children, attrs) in self.modules.items():
++            new_params, new_buffers, new_children, new_attrs = after.modules[name]
++            where = name or "<root>"
++            if new_params != params:
++                problems.append(f"{where}: parameters replaced, added or removed")
++            if new_buffers != buffers:
++                problems.append(f"{where}: buffers replaced, added or removed")
++            if new_children != children:
++                problems.append(f"{where}: submodules replaced, added or removed")
++            for key in sorted(attrs.keys() | new_attrs.keys()):
++                before = attrs.get(key)
++                current = new_attrs.get(key)
++                if _same_state(before, current, owned):
++                    continue
++                if (
++                    current is not None
++                    and current[0] == "data"
++                    and (before is None or before[0] == "data")
++                ):
++                    module = model.get_submodule(name)
++                    replay.append(
++                        {
++                            "module": name,
++                            "attr": key,
++                            "before": {"missing": True}
++                            if before is None
++                            else json.loads(before[1]),
++                            "after": _encode_attr(module, key),
++                        }
++                    )
++                    continue
++                problems.append(
++                    f"{where}.{key}: changed in a way a snapshot cannot replay"
++                )
++        return replay, problems
++
++
++def _same_state(a: Any, b: Any, owned: set[tuple[str, int, int]]) -> bool:
++    if a == b:
++        return True
++    if a is None or b is None or a[0] != b[0]:
++        return False
++    if a[0] == "tensor":
++        # Same tensor, written in place through a parameter/buffer storage.
++        return a[1] == b[1] and a[3] == b[3] and a[3] in owned
++    if a[0] == "seq":
++        return (
++            a[1:3] == b[1:3]
++            and len(a[3]) == len(b[3])
++            and all(_same_state(x, y, owned) for x, y in zip(a[3], b[3]))
++        )
++    if a[0] == "map":
++        return (
++            a[1] == b[1]
++            and [k for k, _ in a[2]] == [k for k, _ in b[2]]
++            and all(_same_state(x, y, owned) for (_, x), (_, y) in zip(a[2], b[2]))
++        )
++    return False
++
++
++def _apply_replay(model: nn.Module, ops: list[dict[str, Any]]) -> None:
++    for op in ops:
++        module = model.get_submodule(op["module"])
++        value = _decode(op["after"])
++        current = module.__dict__.get(op["attr"], _MISSING)
++        if isinstance(current, list) and isinstance(value, list):
++            current[:] = value  # keep the list object other references may hold
++        elif isinstance(current, dict) and isinstance(value, dict):
++            current.clear()
++            current.update(value)
++        else:
++            setattr(module, op["attr"], value)
++
++
++def _check_replay(model: nn.Module, ops: list[dict[str, Any]]) -> None:
++    for op in ops:
++        try:
++            module = model.get_submodule(op["module"])
++            current = _encode_attr(module, op["attr"])
++        except (AttributeError, _NotData) as exc:
++            raise SnapshotUnusable(
++                f"replay target {op['module']}.{op['attr']} unusable: {exc}"
++            ) from exc
++        if current != op["before"]:
++            raise SnapshotUnusable(
++                f"{op['module'] or '<root>'}.{op['attr']} does not start where the "
++                "snapshot's load started"
++            )
++
++
++# ── staged I/O ──────────────────────────────────────────────────────────────────
++
++
++class _Staging:
++    """4 KiB-aligned host slots, registered with CUDA while device copies use
++    them (vLLM's pinned-staging pattern; no caching host allocator)."""
++
++    def __init__(self, slots: int, slot_bytes: int, pin: bool):
++        raw = torch.empty(slots * slot_bytes + _ALIGN, dtype=torch.uint8, device="cpu")
++        start = -raw.data_ptr() % _ALIGN
++        self.buffer = raw[start : start + slots * slot_bytes]
++        self.slots = [
++            self.buffer[i * slot_bytes : (i + 1) * slot_bytes] for i in range(slots)
++        ]
++        self.views = [memoryview(slot.numpy()) for slot in self.slots]
++        self._pinned = False
++        if pin:
++            err = torch.cuda.cudart().cudaHostRegister(
++                self.buffer.data_ptr(), self.buffer.nbytes, 0
++            )
++            if getattr(err, "value", err) != 0:
++                raise RuntimeError(f"cudaHostRegister failed: {err}")
++            self._pinned = True
++
++    def close(self) -> None:
++        if self._pinned:
++            torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
++            self._pinned = False
++
++
++class _Pipeline:
++    """Slots cycling between the device copy stream and I/O worker threads."""
++
++    def __init__(self, devices: set[torch.device]):
++        cuda = [d for d in devices if d.type == "cuda"]
++        if len(cuda) > 1:
++            raise SnapshotUnusable("parameters span several CUDA devices")
++        self.device = cuda[0] if cuda else None
++        self.staging = _Staging(_SLOTS, _CHUNK, pin=self.device is not None)
++        self.stream = (
++            torch.cuda.Stream(self.device) if self.device is not None else None
++        )
++        self.events = [
++            torch.cuda.Event() if self.device is not None else None
++            for _ in range(_SLOTS)
++        ]
++        self.pool = ThreadPoolExecutor(_SLOTS, thread_name_prefix="weight-snapshot")
++
++    @contextlib.contextmanager
++    def copies(self) -> Iterator[None]:
++        if self.stream is None:
++            yield
++            return
++        torch.cuda.synchronize(self.device)
++        with torch.cuda.stream(self.stream):
++            yield
++
++    def record(self, slot: int) -> torch.cuda.Event | None:
++        event = self.events[slot]
++        if event is not None:
++            event.record(self.stream)
++        return event
++
++    def close(self) -> None:
++        # Workers may still be writing into a slot after a failure.
++        self.pool.shutdown(wait=True, cancel_futures=True)
++        if self.stream is not None:
++            self.stream.synchronize()
++        self.staging.close()
++
++
++def _pread(fd: int, view: memoryview, offset: int) -> None:
++    done = 0
++    while done < len(view):
++        count = os.preadv(fd, [view[done:]], offset + done)
++        if count <= 0:
++            raise OSError(f"short read at offset {offset + done}")
++        done += count
++
++
++def _pwrite(fd: int, view: memoryview, offset: int) -> None:
++    done = 0
++    while done < len(view):
++        count = os.pwritev(fd, [view[done:]], offset + done)
++        if count <= 0:
++            raise OSError(f"short write at offset {offset + done}")
++        done += count
++
++
++def _wait(event: torch.cuda.Event | None) -> None:
++    if event is not None:
++        event.synchronize()
++
++
++def _device_to_host(
++    pieces: list[_Chunk],
++    sources: list[torch.Tensor],
++    consume: Callable[[int, memoryview], Any],
++) -> list[Any]:
++    """Copy each piece's segments into a slot, zero what they leave uncovered,
++    and hand the slot to ``consume(index, view)`` on a worker thread."""
++    results: list[Any] = [None] * len(pieces)
++    pending: list[tuple[int, Future] | None] = [None] * _SLOTS
++    pipeline = _Pipeline({s.device for s in sources})
++
++    def task(index: int, slot: int, event: torch.cuda.Event | None) -> Any:
++        _wait(event)
++        return consume(index, pipeline.staging.views[slot][: pieces[index].length])
++
++    try:
++        with pipeline.copies():
++            for index, piece in enumerate(pieces):
++                slot = index % _SLOTS
++                if pending[slot] is not None:
++                    done_index, future = pending[slot]
++                    results[done_index] = future.result()
++                staging = pipeline.staging.slots[slot]
++                covered = 0
++                for storage, start, rel, length in piece.segments:
++                    if rel > covered:
++                        staging[covered:rel].zero_()
++                    staging[rel : rel + length].copy_(
++                        sources[storage][start : start + length], non_blocking=True
++                    )
++                    covered = rel + length
++                if covered < piece.length:
++                    staging[covered : piece.length].zero_()
++                event = pipeline.record(slot)
++                pending[slot] = (index, pipeline.pool.submit(task, index, slot, event))
++            for item in pending:
++                if item is not None:
++                    results[item[0]] = item[1].result()
++    finally:
++        pipeline.close()
++    return results
++
++
++def _host_to_device(
++    fd: int,
++    chunks: list[_Chunk],
++    targets: list[torch.Tensor],
++    expected: list[int] | None,
++) -> None:
++    """Read each chunk into a slot with O_DIRECT (CRC32 on the worker thread),
++    then copy its segments into the target storages on the copy stream."""
++    pipeline = _Pipeline({t.device for t in targets})
++    futures: dict[int, Future] = {}
++
++    def task(index: int, slot: int, event: torch.cuda.Event | None) -> int | None:
++        _wait(event)
++        chunk = chunks[index]
++        view = pipeline.staging.views[slot][: chunk.length]
++        _pread(fd, view, chunk.offset)
++        return zlib.crc32(view) if expected is not None else None
++
++    try:
++        for index in range(min(_SLOTS, len(chunks))):
++            futures[index] = pipeline.pool.submit(task, index, index, None)
++        with pipeline.copies():
++            for index, chunk in enumerate(chunks):
++                slot = index % _SLOTS
++                crc = futures.pop(index).result()
++                if expected is not None and crc != expected[index]:
++                    raise SnapshotUnusable(
++                        f"CRC32 mismatch in chunk {index} at offset {chunk.offset}"
++                    )
++                staging = pipeline.staging.slots[slot]
++                for storage, start, rel, length in chunk.segments:
++                    targets[storage][start : start + length].copy_(
++                        staging[rel : rel + length], non_blocking=True
++                    )
++                event = pipeline.record(slot)
++                following = index + _SLOTS
++                if following < len(chunks):
++                    futures[following] = pipeline.pool.submit(
++                        task, following, slot, event
++                    )
++    finally:
++        pipeline.close()
++
++
++def _fsync_dir(path: Path) -> None:
++    fd = os.open(path, os.O_RDONLY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++# ── one rank's snapshot on disk ─────────────────────────────────────────────────
++
++
++class SnapshotStore:
++    """Snapshots of one rank under ``root``: ``<prefix>-<key>/`` holds the data
++    file, the manifest and the COMPLETE marker (the manifest's SHA-256)."""
++
++    def __init__(
++        self,
++        root: Path,
++        prefix: str,
++        key: str,
++        factors: dict[str, Any],
++        *,
++        direct: bool = True,
++        verify: bool = True,
++    ):
++        self.root = Path(root)
++        self.prefix = prefix
++        self.key = key
++        self.factors = factors
++        self.direct = direct
++        self.verify = verify
++        self.path = self.root / f"{prefix}-{key[:24]}"
++        self.manifest: dict[str, Any] | None = None
++
++    def _flags(self) -> int:
++        if not self.direct:
++            return 0
++        if not _O_DIRECT:
++            raise SnapshotUnusable("O_DIRECT is unavailable on this platform")
++        return _O_DIRECT
++
++    def check(self, model: nn.Module) -> _Layout:
++        """Raise SnapshotUnusable unless a complete snapshot with this key
++        matches the model's layout and replay preconditions."""
++        complete = self.path / COMPLETE_FILE
++        if not complete.is_file():
++            raise SnapshotUnusable(
++                f"no snapshot for this key at {self.path}{self._newest_sibling_diff()}"
++            )
++        raw = (self.path / MANIFEST_FILE).read_bytes()
++        if complete.read_text().strip() != hashlib.sha256(raw).hexdigest():
++            raise SnapshotUnusable("manifest does not match its COMPLETE marker")
++        manifest = json.loads(raw)
++        if manifest.get("format") != FORMAT or manifest.get("key") != self.key:
++            raise SnapshotUnusable("manifest format or key differs")
++        layout = _layout(model)
++        recorded = [manifest["tensors"], manifest["storages"], manifest["data_bytes"]]
++        current = json.loads(json.dumps(layout.signature()))
++        if recorded != current:
++            first = next(
++                (
++                    f"{a.get('name')}: {a} vs {b}"
++                    for a, b in zip(recorded[0], current[0])
++                    if a != b
++                ),
++                f"{len(recorded[0])} vs {len(current[0])} tensors",
++            )
++            raise SnapshotUnusable(
++                f"the model's tensor layout differs from the snapshot's ({first})"
++            )
++        size = (self.path / DATA_FILE).stat().st_size
++        if size != layout.data_bytes:
++            raise SnapshotUnusable(
++                f"data file holds {size} bytes, expected {layout.data_bytes}"
++            )
++        _check_replay(model, manifest["replay"])
++        self.manifest = manifest
++        return layout
++
++    def restore(self, model: nn.Module, layout: _Layout) -> None:
++        """Overwrite every storage from the data file, then replay the load's
++        plain-data side effects. Call check() first."""
++        manifest = self.manifest
++        assert manifest is not None
++        if manifest["chunk_bytes"] != _CHUNK:
++            raise SnapshotUnusable("snapshot chunk size differs")
++        chunks = _chunks(layout)
++        expected = manifest["chunk_crc32"] if self.verify else None
++        if expected is not None and len(expected) != len(chunks):
++            raise SnapshotUnusable("snapshot chunk count differs")
++        fd = os.open(self.path / DATA_FILE, os.O_RDONLY | os.O_CLOEXEC | self._flags())
++        try:
++            _host_to_device(fd, chunks, [_bytes(s) for s in layout.storages], expected)
++        finally:
++            os.close(fd)
++        _apply_replay(model, manifest["replay"])
++
++    def write(
++        self, model: nn.Module, replay: list[dict[str, Any]], keep: int = 1
++    ) -> int:
++        """Write the model's storages, manifest and marker into a temporary
++        directory and rename it into place. Returns the data bytes."""
++        layout = _layout(model)
++        flags = self._flags()
++        self.root.mkdir(parents=True, exist_ok=True)
++        self._prune(max(keep, 1) - 1)
++        free = shutil.disk_usage(self.root).free
++        if free < layout.data_bytes + _SPACE_MARGIN:
++            raise SnapshotUnusable(
++                f"{_gib(free):.1f} GiB free under {self.root}, need "
++                f"{_gib(layout.data_bytes + _SPACE_MARGIN):.1f} GiB"
++            )
++        tmp = self.root / f".tmp-{self.path.name}-{os.getpid()}"
++        shutil.rmtree(tmp, ignore_errors=True)
++        tmp.mkdir()
++        try:
++            fd = os.open(
++                tmp / DATA_FILE,
++                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | flags,
++                0o644,
++            )
++            try:
++                if hasattr(os, "posix_fallocate") and layout.data_bytes:
++                    os.posix_fallocate(fd, 0, layout.data_bytes)
++                chunks = _chunks(layout)
++
++                def consume(index: int, view: memoryview) -> int:
++                    crc = zlib.crc32(view)
++                    _pwrite(fd, view, chunks[index].offset)
++                    return crc
++
++                crcs = _device_to_host(
++                    chunks, [_bytes(s) for s in layout.storages], consume
++                )
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++            manifest = {
++                "format": FORMAT,
++                "key": self.key,
++                "key_factors": self.factors,
++                "tensors": layout.tensors,
++                "storages": json.loads(json.dumps(layout.signature()[1])),
++                "data_bytes": layout.data_bytes,
++                "chunk_bytes": _CHUNK,
++                "chunk_crc32": crcs,
++                "replay": replay,
++                "created": time.time(),
++            }
++            raw = json.dumps(manifest, sort_keys=True).encode()
++            for name, content in (
++                (MANIFEST_FILE, raw),
++                (COMPLETE_FILE, hashlib.sha256(raw).hexdigest().encode() + b"\n"),
++            ):
++                with open(tmp / name, "wb") as handle:
++                    handle.write(content)
++                    handle.flush()
++                    os.fsync(handle.fileno())
++            _fsync_dir(tmp)
++            shutil.rmtree(self.path, ignore_errors=True)
++            os.rename(tmp, self.path)
++            _fsync_dir(self.root)
++        except BaseException:
++            shutil.rmtree(tmp, ignore_errors=True)
++            raise
++        return layout.data_bytes
++
++    def discard(self) -> None:
++        shutil.rmtree(self.path, ignore_errors=True)
++
++    def _siblings(self) -> list[Path]:
++        if not self.root.is_dir():
++            return []
++        return [
++            p
++            for p in self.root.iterdir()
++            if p.name.startswith(f"{self.prefix}-") and p != self.path
++        ]
++
++    def _newest_sibling_diff(self) -> str:
++        """Which key factors differ from this rank's newest other snapshot."""
++        others = sorted(self._siblings(), key=lambda p: p.stat().st_mtime, reverse=True)
++        for other in others:
++            try:
++                factors = json.loads((other / MANIFEST_FILE).read_bytes())[
++                    "key_factors"
++                ]
++            except (OSError, ValueError, KeyError):
++                continue
++            changed = _differences(factors, self.factors)
++            listed = ", ".join(changed[:12]) + (" ..." if len(changed) > 12 else "")
++            return f" ({other.name} differs in {listed or 'nothing visible'})"
++        return ""
++
++    def _prune(self, keep_others: int) -> None:
++        """Drop this rank's abandoned temporary directories and all but the
++        newest ``keep_others`` snapshots with other keys."""
++        for stale in self.root.glob(f".tmp-{self.prefix}-*"):
++            shutil.rmtree(stale, ignore_errors=True)
++        others = sorted(self._siblings(), key=lambda p: p.stat().st_mtime, reverse=True)
++        for old in others[keep_others:]:
++            shutil.rmtree(old, ignore_errors=True)
++
++
++# ── the key ─────────────────────────────────────────────────────────────────────
++
++
++def _differences(a: Any, b: Any, prefix: str = "", depth: int = 0) -> list[str]:
++    """Dotted paths (four levels deep) where two key-factor trees differ."""
++    if isinstance(a, dict) and isinstance(b, dict) and depth < 4:
++        found: list[str] = []
++        for name in sorted(a.keys() | b.keys()):
++            found += _differences(
++                a.get(name), b.get(name), f"{prefix}{name}.", depth + 1
++            )
++        return found
++    return [] if a == b else [prefix.rstrip(".")]
++
++
++def _checkpoint_fingerprint(model_dir: str) -> dict[str, Any]:
++    root = Path(model_dir)
++    if not root.is_dir():
++        raise SnapshotUnusable(f"model path {model_dir} is not a local directory")
++    files: dict[str, Any] = {}
++    for path in sorted(root.iterdir()):
++        if not path.is_file():
++            continue
++        stat = path.stat()
++        entry: dict[str, Any] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
++        if path.suffix == ".safetensors":
++            with open(path, "rb") as handle:
++                length = int.from_bytes(handle.read(8), "little")
++                if length > 100 << 20:
++                    raise SnapshotUnusable(f"invalid safetensors header in {path.name}")
++                entry["header_sha256"] = hashlib.sha256(handle.read(length)).hexdigest()
++        elif path.suffix == ".json":
++            entry["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
++        files[path.name] = entry
++    return {"path": str(root.resolve()), "files": files}
++
++
++def _source_fingerprint(package: str) -> str | None:
++    """Sizes and mtimes of a package's Python sources (catches rebuilt images
++    and files mounted over the image)."""
++    import importlib.util
++
++    spec = importlib.util.find_spec(package)
++    if spec is None or not spec.submodule_search_locations:
++        return None
++    digest = hashlib.sha256()
++    for location in sorted(spec.submodule_search_locations):
++        for directory, dirs, files in os.walk(location):
++            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
++            for name in sorted(files):
++                if name.endswith(".py"):
++                    path = os.path.join(directory, name)
++                    stat = os.stat(path)
++                    relative = os.path.relpath(path, location)
++                    digest.update(
++                        f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode()
++                    )
++    return digest.hexdigest()
++
++
++def _environment() -> dict[str, str]:
++    return {
++        name: value
++        for name, value in sorted(os.environ.items())
++        if name.startswith(_ENV_PREFIXES)
++        and not _ENV_EXCLUDED.intersection(name.split("_"))
++        and not (name.startswith(ENV_ENABLE) and name != ENV_TAG)
++    }
++
++
++def _key_factors(
++    vllm_config: Any, model_config: Any, ranks: dict[str, Any]
++) -> dict[str, Any]:
++    import vllm
++
++    device = torch.cuda.current_device() if torch.cuda.is_available() else None
++    hf_config = model_config.hf_config
++    return {
++        "format": FORMAT,
++        "tag": os.environ.get(ENV_TAG, ""),
++        "ranks": ranks,
++        "checkpoint": _checkpoint_fingerprint(model_config.model),
++        "engine": {
++            "vllm": vllm.__version__,
++            "vllm_sources": _source_fingerprint("vllm"),
++            "b12x_sources": _source_fingerprint("b12x"),
++            "torch": torch.__version__,
++            "cuda": torch.version.cuda,
++            "device": None
++            if device is None
++            else [
++                torch.cuda.get_device_name(device),
++                list(torch.cuda.get_device_capability(device)),
++            ],
++        },
++        "config": {
++            "vllm_hash": vllm_config.compute_hash(),
++            "model": model_config.model,
++            "revision": model_config.revision,
++            "dtype": str(model_config.dtype),
++            "quantization": model_config.quantization,
++            # The resolved config, overrides included; objects reduce to their
++            # type names so the key never depends on an address in a repr.
++            "hf_config": hashlib.sha256(
++                json.dumps(
++                    hf_config.to_dict(),
++                    sort_keys=True,
++                    default=lambda value: type(value).__qualname__,
++                ).encode()
++            ).hexdigest(),
++            "load_format": str(vllm_config.load_config.load_format),
++            "loader_extra": json.dumps(
++                vllm_config.load_config.model_loader_extra_config,
++                sort_keys=True,
++                default=str,
++            ),
++        },
++        "environment": _environment(),
++    }
++
++
++def _ranks() -> dict[str, Any]:
++    import torch.distributed as dist
++
++    if not (dist.is_available() and dist.is_initialized()):
++        return {"world": [0, 1], "tp": [0, 1], "pp": [0, 1]}
++    from vllm.distributed.parallel_state import (
++        get_pp_group,
++        get_tp_group,
++        get_world_group,
++    )
++
++    world, tp, pp = get_world_group(), get_tp_group(), get_pp_group()
++    return {
++        "world": [world.rank_in_group, world.world_size],
++        "tp": [tp.rank_in_group, tp.world_size],
++        "pp": [pp.rank_in_group, pp.world_size],
++    }
++
++
++def _every_rank(flag: bool) -> bool:
++    """True only if ``flag`` holds on every rank (a CPU-group all-reduce)."""
++    import torch.distributed as dist
++
++    if not (dist.is_available() and dist.is_initialized()):
++        return flag
++    from vllm.distributed.parallel_state import get_world_group
++
++    value = torch.tensor([1 if flag else 0], dtype=torch.int32)
++    dist.all_reduce(value, op=dist.ReduceOp.MIN, group=get_world_group().cpu_group)
++    return bool(value.item())
++
++
++# ── digests of the processed model (verification) ───────────────────────────────
++
++
++def _walk_attributes(
++    path: str,
++    value: Any,
++    depth: int,
++    tensors: list[tuple[str, torch.Tensor]],
++    values: dict[str, Any],
++    visited: set[int],
++) -> None:
++    if isinstance(value, torch.Tensor):
++        tensors.append((path, value))
++        return
++    if isinstance(value, nn.Module) or depth > 6:
++        return
++    if value is None or type(value) in (bool, int, float, str):
++        values[path] = _encode(value)
++        return
++    if isinstance(value, (list, tuple)):
++        for i, item in enumerate(value[:4096]):
++            _walk_attributes(f"{path}[{i}]", item, depth + 1, tensors, values, visited)
++        return
++    if isinstance(value, dict):
++        for i, (k, item) in enumerate(value.items()):
++            if i >= 4096:
++                break
++            _walk_attributes(
++                f"{path}[{k!r}]", item, depth + 1, tensors, values, visited
++            )
++        return
++    kind = type(value)
++    if not (kind.__module__ or "").startswith(
++        ("vllm.", "b12x.")
++    ) or kind.__name__.endswith("Config"):
++        return
++    if id(value) in visited or not hasattr(value, "__dict__"):
++        return
++    visited.add(id(value))
++    for key, item in list(vars(value).items()):
++        _walk_attributes(f"{path}.{key}", item, depth + 1, tensors, values, visited)
++
++
++def digest_model(model: nn.Module) -> dict[str, Any]:
++    """CRC32 digests of every tensor reachable from the model: parameters,
++    buffers, and tensors held in plain attributes (also inside lists, dicts and
++    vLLM/B12X helper objects), each over the bytes of its storage its views
++    span; plus the plain scalar attributes found on the way."""
++    tensors: list[tuple[str, torch.Tensor]] = []
++    values: dict[str, Any] = {}
++    for name, tensor in model.named_parameters(remove_duplicate=False):
++        tensors.append((f"param:{name}", tensor))
++    for name, tensor in model.named_buffers(remove_duplicate=False):
++        tensors.append((f"buffer:{name}", tensor))
++    visited: set[int] = set()
++    for module_name, module in model.named_modules():
++        for key, value in module.__dict__.items():
++            if (
++                key in _MODULE_KEYS
++                or key.endswith("_hooks")
++                or key.startswith("_forward")
++            ):
++                continue
++            _walk_attributes(
++                f"attr:{module_name}:{key}", value, 0, tensors, values, visited
++            )
++    # One extent per storage: the union of the byte ranges its tensors span.
++    extents: dict[tuple[str, int, int], list[Any]] = {}
++    records: list[dict[str, Any]] = []
++    for name, tensor in tensors:
++        record: dict[str, Any] = {
++            "name": name,
++            "dtype": str(tensor.dtype),
++            "shape": list(tensor.shape),
++            "stride": list(tensor.stride()),
++        }
++        records.append(record)
++        if tensor.device.type not in ("cpu", "cuda") or tensor.numel() == 0:
++            continue
++        try:
++            storage = tensor.untyped_storage()
++        except (RuntimeError, NotImplementedError):
++            record["digest"] = "no storage"
++            continue
++        size = tensor.element_size()
++        low = tensor.storage_offset() * size
++        span = 1 + sum((n - 1) * abs(s) for n, s in zip(tensor.shape, tensor.stride()))
++        high = min(low + span * size, storage.nbytes())
++        key = _storage_key(tensor)
++        entry = extents.setdefault(key, [storage, low, high, []])
++        entry[1], entry[2] = min(entry[1], low), max(entry[2], high)
++        entry[3].append(record)
++    pieces: list[_Chunk] = []
++    sources: list[torch.Tensor] = []
++    owners: list[int] = []
++    for index, (storage, low, high, _) in enumerate(extents.values()):
++        sources.append(_bytes(storage))
++        for start in range(low, high, _CHUNK):
++            length = min(_CHUNK, high - start)
++            pieces.append(_Chunk(0, length, [(index, start, 0, length)]))
++            owners.append(index)
++    crcs = _device_to_host(pieces, sources, lambda _, view: zlib.crc32(view))
++    per_storage: list[list[int]] = [[] for _ in extents]
++    for owner, crc in zip(owners, crcs):
++        per_storage[owner].append(crc)
++    total = 0
++    for (_, low, high, members), crc_list in zip(extents.values(), per_storage):
++        digest = hashlib.sha256(json.dumps(crc_list).encode()).hexdigest()[:16]
++        total += high - low
++        for record in members:
++            record["digest"] = digest
++    summary = {}
++    for kind in ("param", "buffer", "attr"):
++        chosen = [r for r in records if r["name"].startswith(kind + ":")]
++        summary[kind] = [
++            len(chosen),
++            hashlib.sha256(
++                json.dumps([[r["name"], r.get("digest")] for r in chosen]).encode()
++            ).hexdigest()[:16],
++        ]
++    summary["values"] = [
++        len(values),
++        hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:16],
++    ]
++    return {"summary": summary, "bytes": total, "tensors": records, "values": values}
++
++
++# ── the loader hook ─────────────────────────────────────────────────────────────
++
++
++class WeightSnapshot:
++    """The target model's snapshot for one load (see the module docstring)."""
++
++    def __init__(
++        self, vllm_config: Any, model_config: Any, enabled: bool, digest: bool
++    ):
++        self.vllm_config = vllm_config
++        self.model_config = model_config
++        self.enabled = enabled
++        self.digest = digest
++        self.root = Path(os.environ.get(ENV_DIR, DEFAULT_DIR))
++        self.source = "checkpoint"
++
++    @classmethod
++    def for_load(
++        cls, loader: Any, vllm_config: Any, model_config: Any
++    ) -> WeightSnapshot | None:
++        enabled, digest = _env_flag(ENV_ENABLE), _env_flag(ENV_DIGEST)
++        if not (enabled or digest):
++            return None
++        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++
++        # The target model only: a draft model loads with its own model config.
++        if model_config is not vllm_config.model_config or not isinstance(
++            loader, DefaultModelLoader
++        ):
++            return None
++        return cls(vllm_config, model_config, enabled, digest)
++
++    def load_weights(self, loader: Any, model: nn.Module) -> None:
++        """Restore the model's loaded weights from the snapshot, or load the
++        checkpoint with ``loader`` and write a snapshot."""
++        if not self.enabled:
++            loader.load_weights(model, self.model_config)
++            return
++        if any(
++            getattr(getattr(m, "quant_method", None), "uses_meta_device", False)
++            for m in model.modules()
++        ):
++            logger.info("Weight snapshot not used: online quantization loads layerwise")
++            loader.load_weights(model, self.model_config)
++            return
++        store, layout, reason = self._open(model)
++        if _every_rank(reason is None):
++            assert store is not None and layout is not None
++            start = time.perf_counter()
++            failure = None
++            try:
++                store.restore(model, layout)
++            except Exception as exc:  # noqa: BLE001 - every failure loads the checkpoint
++                failure = exc
++            end = time.perf_counter()
++            if _every_rank(failure is None):
++                self.source = "snapshot"
++                # The loader's own timers (B12X reports its throughput from them)
++                # time the restore in place of a checkpoint pass.
++                loader.counter_before_loading_weights = start
++                loader.counter_after_loading_weights = end
++                logger.info(
++                    "Weight snapshot restored %.2f GiB (%d tensors in %d storages) in "
++                    "%.2f s (%.2f GB/s, CRC32 %s) from %s",
++                    _gib(layout.data_bytes),
++                    len(layout.tensors),
++                    len(layout.storages),
++                    end - start,
++                    layout.data_bytes / max(end - start, 1e-9) / 1e9,
++                    "checked" if store.verify else "not checked",
++                    store.path,
++                )
++                return
++            if failure is not None:
++                logger.warning(
++                    "Weight snapshot restore failed (%s: %s); discarding %s and "
++                    "loading the checkpoint on every rank",
++                    type(failure).__name__,
++                    failure,
++                    store.path,
++                )
++                store.discard()
++                reason = "restore failed"
++            else:
++                logger.warning(
++                    "Weight snapshot restore failed on another rank; loading the "
++                    "checkpoint on every rank"
++                )
++        elif reason is None:
++            logger.info(
++                "Weight snapshot not used: another rank has no usable snapshot; "
++                "loading the checkpoint"
++            )
++        else:
++            logger.info("Weight snapshot not used (%s); loading the checkpoint", reason)
++        probe = None
++        if store is not None and reason is not None:
++            try:
++                probe = LoadProbe(model)
++            except Exception as exc:  # noqa: BLE001 - load without writing
++                logger.warning(
++                    "Weight snapshot not written (%s: %s)", type(exc).__name__, exc
++                )
++        loader.load_weights(model, self.model_config)
++        if probe is not None:
++            assert store is not None
++            self._write(store, model, probe)
++
++    def _open(
++        self, model: nn.Module
++    ) -> tuple[SnapshotStore | None, _Layout | None, str | None]:
++        try:
++            ranks = _ranks()
++            factors = _key_factors(self.vllm_config, self.model_config, ranks)
++            key = hashlib.sha256(
++                json.dumps(factors, sort_keys=True).encode()
++            ).hexdigest()
++            rank, world = ranks["world"]
++            store = SnapshotStore(
++                self.root,
++                f"rank{rank:02d}of{world:02d}",
++                key,
++                factors,
++                verify=_env_flag(ENV_VERIFY, "1"),
++            )
++        except Exception as exc:  # noqa: BLE001 - a key we cannot form means no snapshot
++            return None, None, f"cannot key a snapshot: {type(exc).__name__}: {exc}"
++        try:
++            return store, store.check(model), None
++        except Exception as exc:  # noqa: BLE001 - any doubt loads the checkpoint
++            return store, None, str(exc) or type(exc).__name__
++
++    def _write(self, store: SnapshotStore, model: nn.Module, probe: LoadProbe) -> None:
++        try:
++            owned = set(map(_storage_key_of, _layout(model).storages))
++            replay, problems = probe.changes(model, owned)
++            if problems:
++                logger.warning(
++                    "Weight snapshot not written: load_weights changed state a "
++                    "snapshot cannot replay: %s%s",
++                    "; ".join(problems[:8]),
++                    f" (+{len(problems) - 8} more)" if len(problems) > 8 else "",
++                )
++                return
++            start = time.perf_counter()
++            nbytes = store.write(
++                model, replay, keep=max(int(os.environ.get(ENV_KEEP, "1")), 1)
++            )
++            elapsed = time.perf_counter() - start
++            logger.info(
++                "Weight snapshot written: %.2f GiB in %.2f s (%.2f GB/s, %d replayed "
++                "attributes) to %s",
++                _gib(nbytes),
++                elapsed,
++                nbytes / max(elapsed, 1e-9) / 1e9,
++                len(replay),
++                store.path,
++            )
++        except Exception as exc:  # noqa: BLE001 - the loaded model stays valid
++            logger.warning(
++                "Weight snapshot not written (%s: %s)", type(exc).__name__, exc
++            )
++
++    def after_processing(self, model: nn.Module) -> None:
++        """With DSV41_WEIGHT_SNAPSHOT_DIGEST=1, digest the processed model."""
++        if not self.digest:
++            return
++        start = time.perf_counter()
++        try:
++            result = digest_model(model)
++            rank, world = _ranks()["world"]
++            directory = self.root / "digests"
++            directory.mkdir(parents=True, exist_ok=True)
++            path = directory / (
++                f"rank{rank:02d}of{world:02d}-{time.strftime('%Y%m%dT%H%M%S')}-"
++                f"{os.getpid()}-{self.source}.json"
++            )
++            result["source"] = self.source
++            path.write_text(json.dumps(result, indent=1, sort_keys=True))
++        except Exception as exc:  # noqa: BLE001 - verification must not stop serving
++            logger.warning("Weight digest failed (%s: %s)", type(exc).__name__, exc)
++            return
++        summary = result["summary"]
++        logger.info(
++            "Weight digest after %s load: params %s/%s, buffers %s/%s, attribute "
++            "tensors %s/%s, scalar attributes %s/%s (count/digest) over %.2f GiB in "
++            "%.2f s; per-tensor digests in %s",
++            self.source,
++            *summary["param"],
++            *summary["buffer"],
++            *summary["attr"],
++            *summary["values"],
++            _gib(result["bytes"]),
++            time.perf_counter() - start,
++            path,
++        )
++
++
++def _storage_key_of(storage: torch.UntypedStorage) -> tuple[str, int, int]:
++    return str(storage.device), storage.data_ptr(), storage.nbytes()

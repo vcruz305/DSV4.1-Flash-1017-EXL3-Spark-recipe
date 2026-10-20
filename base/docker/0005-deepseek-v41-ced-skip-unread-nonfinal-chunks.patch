@@ -1,0 +1,578 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 15:00:00 +0000
+Subject: [PATCH] DeepSeek V4.1 CED: one decoder row for a prefill chunk
+ nothing reads again
+
+A step's CED decoder (layers from the full-resolution KV source on) runs on
+each request's last 128 rows, and later steps read those rows' decoder state
+only through 128-row windows: the next chunk's kept rows replay from inside
+that chunk once it has more than 128 rows, decode rows read the last 128
+positions, and the DSpark drafter reads back from a draft's first position by
+its SWA index width. With the scheduler's aligned prefill chunks
+(ALIGN_PREFILL_CHUNKS, the TileLang family), a non-final chunk that ends on a
+long_prefill_token_threshold boundary is followed by min(remaining, threshold)
+rows, so when at least max(window, DSpark SWA index width) + 1 + the step's
+sampled and draft rows remain (200 at k=6), no later decoder or draft window
+reaches its decoder rows, and its logits are discarded (a chunked prefill
+samples no token). Such a chunk now keeps one decoder row, its last, instead
+of 128; its global KV and index keys are still built from every row at the
+boundary layer. Every token the request commits is computed from the same
+values as before; other requests in the step see the same inputs, and the
+same bits where the decoder kernels do not depend on the step's row count.
+
+plan_ced and CEDState.stage take per-request kept-row limits
+(nonfinal_limits); the plan's max_query_len keeps the window bound, so the
+decoder runs in the same mode and plans as without the limit. Chunks that are
+not truncated anyway, prompt-logprobs requests, multimodal requests (encoder
+budgets can cut their next chunk short) and other drafters keep their rows. A
+skipped chunk's end becomes the request's replay floor for its later steps,
+so even a later chunk the scheduler shortened cannot read the skipped rows.
+DSV41_CED_SKIP_NONFINAL=0 turns it off.
+
+The CED decoder and its replay start are Local Inference Lab's (Luke Alonso)
+and Christopher Owen's (spark-ds41f) code; the bounded decoder replay follows
+the idea of vllm-project/vllm#58132 (ivanium) and #59894 (gcanlin). No
+upstream code is ported.
+
+License: Apache-2.0 (dsv41-1017 recipe, DeepSeek-V4.1-Flash-1017-4x-DGX-Spark).
+---
+ .../attention/test_b12x_v41_ced_metadata.py   | 137 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/ced.py              |  89 ++++++++++--
+ .../deepseek_v4_1/nvidia/model_state.py       | 115 +++++++++++++--
+ 3 files changed, 311 insertions(+), 30 deletions(-)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 76241de27..65583de38 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4_1.ced import (
+     CEDState,
+     ced_decoder_start,
+     gather_rows,
++    nonfinal_limits,
+     plan_ced,
+     scatter_rows,
+ )
+@@ -38,6 +39,76 @@ def test_short_continuation_does_not_replay_old_rows():
+     assert plan.num_tokens == 129
+ 
+ 
++def test_limits_shrink_rows_but_keep_the_window_bound():
++    capacities = (8, 128, 256, 512, 8192)
++    plan = plan_ced([7, 4096], [False, False], capacities, [128, 1])
++    assert (plan.capacity, plan.num_tokens) == (8, 8)
++    # The decoder keeps the mode and plans of the same step without the limit.
++    assert plan.max_query_len == 128
++    assert plan_ced([7, 4096], [False, False], capacities).num_tokens == 135
++
++
++def test_nonfinal_limits_skip_only_unread_chunks():
++    def limits(q, start, total, full=False, ok=True, align=4096, remaining=200):
++        return nonfinal_limits(
++            [7, q],
++            [900, start],
++            [900, total],
++            [False, full],
++            [True, ok],
++            min_remaining=remaining,
++            chunk_align=align,
++        )
++
++    assert limits(4096, 0, 4296) == [128, 1]
++    assert limits(4096, 4096, 8392) == [128, 1]
++    # Fewer than min_remaining rows follow: the next chunk may replay into this one.
++    assert limits(4096, 0, 4295) is None
++    # The final chunk, and chunks off the scheduler's aligned boundaries.
++    assert limits(4096, 0, 4096) is None
++    assert limits(4000, 96, 9000, align=4096) == [128, 1]
++    assert limits(4000, 0, 9000) is None
++    # Prompt logprobs, multimodal requests and untruncated chunks keep their rows.
++    assert limits(4096, 0, 9000, full=True) is None
++    assert limits(4096, 0, 9000, ok=False) is None
++    assert limits(128, 3968, 9000) is None
++
++
++@pytest.mark.parametrize(
++    ("env", "backend", "spec", "align", "expected"),
++    [
++        ("1", "tilelang", "dspark", 16272, (200, 16272)),
++        ("1", "tilelang", None, 16272, (130, 16272)),
++        ("0", "tilelang", "dspark", 16272, (0, 0)),
++        ("1", "b12x", "dspark", 16272, (0, 0)),
++        ("1", "tilelang", "mtp", 16272, (0, 0)),
++        ("1", "tilelang", "dspark", 0, (0, 0)),
++        ("1", "tilelang", "dspark", 199, (0, 0)),
++    ],
++)
++def test_nonfinal_skip_policy(monkeypatch, env, backend, spec, align, expected):
++    from vllm.models.deepseek_v4_1.nvidia.model_state import _nonfinal_skip_policy
++
++    monkeypatch.setenv("DSV41_CED_SKIP_NONFINAL", env)
++    monkeypatch.setenv("VLLM_DS41_KERNEL_BACKEND", backend)
++    config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(
++            long_prefill_token_threshold=align, enable_chunked_prefill=True
++        ),
++        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
++        speculative_config=None
++        if spec is None
++        else SimpleNamespace(
++            use_dspark=lambda: spec == "dspark",
++            draft_model_config=SimpleNamespace(
++                hf_config=SimpleNamespace(sliding_window=128)
++            ),
++            num_speculative_tokens=6,
++        ),
++    )
++    assert _nonfinal_skip_policy(config) == expected
++
++
+ def _state(lengths, seq_lens=None, full=None, prefix=None):
+     lengths = np.asarray(lengths, dtype=np.int32)
+     nr = len(lengths)
+@@ -126,6 +197,8 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
+     state.ced_state, starts, seq = _state([4096, 4096])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {}
++    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
++    state._ced_mm_requests, state._ced_replay_floor = set(), {}
+     state.disk_engram_models, state._prefill_tokens = (), {}
+     batch = SimpleNamespace(
+         num_reqs=2,
+@@ -140,6 +213,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
+             req_id="logprobs",
+             num_computed_tokens=0,
+             sampling_params=SimpleNamespace(prompt_logprobs=0),
++            mm_features=[],
+         ),
+     )
+     state._stage_ced(batch)
+@@ -160,6 +234,69 @@ def test_prefix_hit_short_chunk_has_no_unwritten_decoder_history():
+     assert state.replay_start.tolist() == [4096, 0, 0, 0]
+ 
+ 
++@cuda
++def test_nonfinal_chunk_keeps_its_last_row():
++    state, starts, seq = _state([7, 4096], [900, 4096])
++    state.stage(starts, seq, [7, 4096], [False, False], [0, 0], [128, 1])
++    expected = torch.tensor([0, 1, 2, 3, 4, 5, 6, 4102], device="cuda")
++    torch.testing.assert_close(state.get_indices(), expected)
++    assert state.counts.tolist() == [8, 2]
++    assert state.starts[:3].tolist() == [0, 7, 8]
++    # The kept row replays only itself; the decode row keeps its whole window.
++    assert state.replay_start[:2].tolist() == [0, 4095]
++    assert state.request_positions[:2].tolist() == [893, 4095]
++
++
++@cuda
++def test_skipped_chunks_floor_later_replay(monkeypatch):
++    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
++    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
++
++    monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
++    monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
++    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
++    state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
++    state._ced_skip_min_rows, state._ced_chunk_align = 200, 4096
++    state._ced_mm_requests, state._ced_replay_floor = set(), {}
++    state.disk_engram_models, state._prefill_tokens = (), {}
++    state.add_request(
++        0,
++        SimpleNamespace(
++            req_id="long",
++            num_computed_tokens=0,
++            sampling_params=None,
++            mm_features=[],
++        ),
++    )
++
++    def step(start, rows):
++        starts = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
++        seq = torch.tensor([start + rows], dtype=torch.int32, device="cuda")
++        state._stage_ced(
++            SimpleNamespace(
++                num_reqs=1,
++                req_ids=["long"],
++                query_start_loc=starts,
++                seq_lens=seq,
++                num_scheduled_tokens=np.array([rows]),
++                num_computed_prefill_tokens_np=np.array([start]),
++                prefill_len_np=np.array([12288]),
++                has_prefill=True,
++            )
++        )
++        return state.get_ced_indices().tolist(), state.ced_state.replay_start[0].item()
++
++    assert step(0, 4096) == ([4095], 4095)
++    assert state._ced_replay_floor == {"long": 4096}
++    assert step(4096, 4096) == ([4095], 8191)
++    # The final chunk keeps its window; the floor is below it, so it changes nothing.
++    indices, replay = step(8192, 4096)
++    assert indices == list(range(3968, 4096)) and replay == 12160
++    state.remove_request("long")
++    assert state._ced_replay_floor == {}
++
++
+ @cuda
+ @pytest.mark.parametrize("transpose", [False, True])
+ def test_packing_trailing_dimensions_invalid_rows_and_scatter(transpose):
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 289561bee..300bbd4ef 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -22,6 +22,8 @@ if TYPE_CHECKING:
+     from .sparse_mla import DeepseekV41B12xMetadata
+ 
+ CED_WINDOW = 128
++# The kept-row limit of a request that keeps every row (prompt logprobs, capture).
++_KEEP_ALL = 2**31 - 1
+ 
+ 
+ def ced_decoder_start(hf_config: Any) -> int | None:
+@@ -181,27 +183,78 @@ class CEDPlan:
+     keep_full: tuple[bool, ...]
+ 
+ 
+-def plan_ced(query_lengths, keep_full, capacities: tuple[int, ...]) -> CEDPlan | None:
+-    kept = tuple(
++def plan_ced(
++    query_lengths, keep_full, capacities: tuple[int, ...], limits=None
++) -> CEDPlan | None:
++    """The CPU bounds of a step's decoder rows: each request's last ``CED_WINDOW``
++    rows, or every row where ``keep_full``. ``limits`` (``nonfinal_limits``) lowers a
++    request's kept rows further; ``max_query_len`` keeps the window bound, so the
++    decoder runs in the mode it would without the limits."""
++    bounds = tuple(
+         int(q) if full else min(int(q), CED_WINDOW)
+         for q, full in zip(query_lengths, keep_full)
+     )
+-    if all(k == int(q) for k, q in zip(kept, query_lengths)):
++    if all(b == int(q) for b, q in zip(bounds, query_lengths)):
+         return None
++    kept = (
++        bounds
++        if limits is None
++        else tuple(min(b, int(limit)) for b, limit in zip(bounds, limits))
++    )
+     count = sum(kept)
+     return CEDPlan(
+         capacities[bisect_left(capacities, count)],
+         count,
+-        max(kept, default=0),
++        max(bounds, default=0),
+         tuple(keep_full),
+     )
+ 
+ 
++def nonfinal_limits(
++    query_lengths,
++    computed,
++    prefill_lens,
++    keep_full,
++    eligible,
++    *,
++    min_remaining: int,
++    chunk_align: int,
++) -> list[int] | None:
++    """Kept-row limits for prefill chunks whose decoder rows are never read.
++
++    A request's chunk keeps one decoder row instead of its last ``CED_WINDOW``
++    when the chunk is truncated anyway (more than ``CED_WINDOW`` rows, not
++    ``keep_full``), it is ``eligible``, it ends on a multiple of ``chunk_align``
++    (the scheduler's aligned chunk boundaries), and at least ``min_remaining``
++    prefill rows follow it. The next chunk then has more than ``CED_WINDOW`` rows,
++    so its decoder rows replay from inside it, and every later decoder and draft
++    window starts past this chunk. The one row is the chunk's last, whose logits
++    the runner discards (a chunked prefill samples no token). Returns None when no
++    request qualifies.
++    """
++    limits = [CED_WINDOW] * len(query_lengths)
++    skipped = False
++    for i, (q, start, total, full, ok) in enumerate(
++        zip(query_lengths, computed, prefill_lens, keep_full, eligible)
++    ):
++        end = int(start) + int(q)
++        if (
++            ok
++            and not full
++            and int(q) > CED_WINDOW
++            and end % chunk_align == 0
++            and int(total) - end >= min_remaining
++        ):
++            limits[i] = 1
++            skipped = True
++    return limits if skipped else None
++
++
+ @triton.jit(do_not_specialize=["nr"])
+ def _decoder_requests(
+     Starts,
+     Seq,
+-    KeepFull,
++    Limits,
+     PrefixStart,
+     OutStarts,
+     RequestPositions,
+@@ -210,16 +263,15 @@ def _decoder_requests(
+     nr,
+     R: tl.constexpr,
+     B: tl.constexpr,
+-    WINDOW: tl.constexpr,
+ ):
+     r = tl.arange(0, B)
+     valid = r < nr
+     start = tl.load(Starts + r, valid, other=0)
+     end = tl.load(Starts + r + 1, valid, other=0)
+     seq = tl.load(Seq + r, valid, other=0).to(tl.int64)
+-    full = tl.load(KeepFull + r, valid, other=0)
++    limit = tl.load(Limits + r, valid, other=0)
+     q = end - start
+-    kept = tl.where(full, q, tl.minimum(q, WINDOW))
++    kept = tl.minimum(q, limit)
+     cumulative = tl.cumsum(kept)
+     count = tl.sum(kept)
+     tl.store(OutStarts + r, tl.where(valid, cumulative - kept, count), r <= R)
+@@ -269,7 +321,7 @@ class CEDState:
+         )
+         self.replay_start = torch.empty_like(self.request_positions)
+         self.counts = torch.empty(2, dtype=torch.int32, device=device)
+-        self.keep_full = torch.empty(max_requests, dtype=torch.bool, device=device)
++        self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
+         self.prefix_start = torch.empty_like(self.request_positions)
+         self.plan: CEDPlan | None = None
+ 
+@@ -316,23 +368,31 @@ class CEDState:
+         query_lengths,
+         keep_full,
+         prefix_start,
++        limits=None,
+     ) -> None:
++        """``limits``: optional per-request kept-row limits (``nonfinal_limits``)."""
+         nr = len(query_lengths)
+-        self.plan = plan_ced(query_lengths, keep_full, self.capacities)
++        self.plan = plan_ced(query_lengths, keep_full, self.capacities, limits)
+         # Fresh pinned sources remain owned by the async-copy allocator until
+         # transfer completion; reusing a CPU staging buffer could race overlap.
+-        keep_host = torch.tensor(
+-            keep_full, dtype=torch.bool, device="cpu", pin_memory=True
++        limit_host = torch.tensor(
++            [
++                _KEEP_ALL if full else CED_WINDOW if limits is None else limits[i]
++                for i, full in enumerate(keep_full)
++            ],
++            dtype=torch.int32,
++            device="cpu",
++            pin_memory=True,
+         )
+         prefix_host = torch.tensor(
+             prefix_start, dtype=torch.int64, device="cpu", pin_memory=True
+         )
+-        self.keep_full[:nr].copy_(keep_host, non_blocking=True)
++        self.limits[:nr].copy_(limit_host, non_blocking=True)
+         self.prefix_start[:nr].copy_(prefix_host, non_blocking=True)
+         _decoder_requests[(1,)](
+             starts,
+             seq,
+-            self.keep_full,
++            self.limits,
+             self.prefix_start,
+             self.starts,
+             self.request_positions,
+@@ -341,7 +401,6 @@ class CEDState:
+             nr,
+             self.max_requests,
+             triton.next_power_of_2(self.max_requests + 1),
+-            CED_WINDOW,
+         )
+         if self.plan is not None:
+             _decoder_indices[(triton.cdiv(self.plan.capacity, 128),)](
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 155b13ef0..702e2cf81 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import Any
+ 
+ import numpy as np
+ import torch
+ import torch.nn as nn
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -19,9 +21,11 @@ from vllm.models.deepseek_v4_1.ced import (
+     CEDState,
+     ced_decoder_start,
+     gather_rows,
++    nonfinal_limits,
+ )
+ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+@@ -85,6 +89,46 @@ _gather_lookback_launcher = triton_kernel_dispatcher_with_warmup(
+ )(_gather_lookback_kernel)
+ 
+ 
++def _nonfinal_skip_policy(vllm_config: VllmConfig) -> tuple[int, int]:
++    """``nonfinal_limits``' ``(min_remaining, chunk_align)``, or ``(0, 0)`` when
++    non-final prefill chunks keep their decoder rows.
++
++    The decoder rows of a chunk are skipped only when the scheduler's
++    ``ALIGN_PREFILL_CHUNKS`` (TileLang family) ends every prefill chunk on a
++    multiple of ``long_prefill_token_threshold``: the next chunk then holds
++    ``min(remaining, threshold)`` rows. ``min_remaining`` covers the decoder's
++    window, the DSpark drafter's SWA index width (its reach back from a draft's
++    first position) and the step's sampled and draft rows, one row past each.
++    Other drafters, and ``DSV41_CED_SKIP_NONFINAL=0``, keep every chunk's rows.
++    """
++    if os.environ.get("DSV41_CED_SKIP_NONFINAL", "1") != "1":
++        return 0, 0
++    # vllm/v1/core/sched/scheduler.py ALIGN_PREFILL_CHUNKS.
++    if envs.VLLM_DS41_KERNEL_BACKEND != "tilelang":
++        return 0, 0
++    scheduler = vllm_config.scheduler_config
++    align = scheduler.long_prefill_token_threshold
++    if not scheduler.enable_chunked_prefill or align <= 0:
++        return 0, 0
++    hf = vllm_config.model_config.hf_config
++    reach, rows = max(CED_WINDOW, int(hf.sliding_window)), 1
++    spec = vllm_config.speculative_config
++    if spec is not None:
++        if not spec.use_dspark():
++            return 0, 0
++        window = getattr(spec.draft_model_config.hf_config, "sliding_window", None)
++        reach = max(
++            reach,
++            get_dspark_swa_index_width(
++                hf.sliding_window if window is None else window,
++                spec.num_speculative_tokens,
++            ),
++        )
++        rows += spec.num_speculative_tokens
++    min_remaining = reach + 1 + rows
++    return (min_remaining, align) if align >= min_remaining else (0, 0)
++
++
+ class DeepseekV41ModelState(DefaultModelState):
+     """DefaultModelState plus the engram lookback window.
+ 
+@@ -114,6 +158,14 @@ class DeepseekV41ModelState(DefaultModelState):
+         self.ced_state: CEDState | None = None
+         self._ced_prompt_logprobs: set[str] = set()
+         self._ced_prefix_start: dict[str, int] = {}
++        # Non-final prefill chunks whose decoder rows are never read keep one row
++        # (ced.nonfinal_limits); multimodal requests keep theirs, since encoder
++        # budgets may cut their next chunk short. A skipped chunk's end becomes
++        # the request's replay floor for its later steps, so no window can reach
++        # the skipped rows even if the scheduler shortened a later chunk.
++        self._ced_skip_min_rows, self._ced_chunk_align = 0, 0
++        self._ced_mm_requests: set[str] = set()
++        self._ced_replay_floor: dict[str, int] = {}
+         self._ced_batch: InputBatch | None = None
+         self.max_cudagraph_query_len: int | None = None
+         if ced_decoder_start(self.model_config.hf_config) is not None:
+@@ -141,6 +193,9 @@ class DeepseekV41ModelState(DefaultModelState):
+             self.ced_state = CEDState(
+                 self.max_num_reqs, self.max_num_tokens, capacities, device
+             )
++            self._ced_skip_min_rows, self._ced_chunk_align = _nonfinal_skip_policy(
++                vllm_config
++            )
+             hf = self.model_config.hf_config
+             self.ced_state.warmup(hf.hidden_size, hf.hc_mult)
+             parallel = vllm_config.parallel_config
+@@ -197,19 +252,26 @@ class DeepseekV41ModelState(DefaultModelState):
+         # Fresh decoder pages lack cached history; streaming updates retain
+         # the live request's private pages and therefore its original boundary.
+         pending = self._ced_streaming_prefix_start
+-        prefix_start = (
+-            pending[1]
+-            if pending is not None and pending[0] == new_req_data.req_id
+-            else new_req_data.num_computed_tokens
+-        )
++        streaming = pending is not None and pending[0] == new_req_data.req_id
++        prefix_start = pending[1] if streaming else new_req_data.num_computed_tokens
+         self._ced_streaming_prefix_start = None
+         self._ced_prefix_start[new_req_data.req_id] = prefix_start
++        if not streaming:
++            self._ced_replay_floor.pop(new_req_data.req_id, None)
++        if any(f.modality != "prompt_embeds" for f in new_req_data.mm_features or ()):
++            self._ced_mm_requests.add(new_req_data.req_id)
++        else:
++            self._ced_mm_requests.discard(new_req_data.req_id)
+ 
+     def remove_request(self, req_id: str) -> None:
+         super().remove_request(req_id)
+         self._prefill_tokens.pop(req_id, None)
+         self._ced_prompt_logprobs.discard(req_id)
+         self._ced_prefix_start.pop(req_id, None)
++        self._ced_mm_requests.discard(req_id)
++        pending = self._ced_streaming_prefix_start
++        if pending is None or pending[0] != req_id:
++            self._ced_replay_floor.pop(req_id, None)
+ 
+     def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
+         return (
+@@ -233,20 +295,43 @@ class DeepseekV41ModelState(DefaultModelState):
+         if state is None:
+             return
+         nr = input_batch.num_reqs
++        req_ids = input_batch.req_ids
++        limits = None
++        if force_full:
++            keep_full, prefix_start = [True] * nr, [0] * nr
++        else:
++            keep_full = [req_id in self._ced_prompt_logprobs for req_id in req_ids]
++            prefix_start = [self._ced_prefix_start.get(req_id, 0) for req_id in req_ids]
++            if self._ced_skip_min_rows and input_batch.has_prefill:
++                computed = input_batch.num_computed_prefill_tokens_np[:nr]
++                for i, req_id in enumerate(req_ids):
++                    # A floor set by an earlier step's skipped chunk; never this
++                    # step's own, whose rows all lie below it.
++                    floor = self._ced_replay_floor.get(req_id, 0)
++                    if floor <= computed[i]:
++                        prefix_start[i] = max(prefix_start[i], floor)
++                limits = nonfinal_limits(
++                    input_batch.num_scheduled_tokens[:nr],
++                    computed,
++                    input_batch.prefill_len_np[:nr],
++                    keep_full,
++                    [req_id not in self._ced_mm_requests for req_id in req_ids],
++                    min_remaining=self._ced_skip_min_rows,
++                    chunk_align=self._ced_chunk_align,
++                )
++                if limits is not None:
++                    for i, req_id in enumerate(req_ids):
++                        if limits[i] < CED_WINDOW:
++                            self._ced_replay_floor[req_id] = int(computed[i]) + int(
++                                input_batch.num_scheduled_tokens[i]
++                            )
+         state.stage(
+             input_batch.query_start_loc,
+             input_batch.seq_lens,
+             input_batch.num_scheduled_tokens[:nr],
+-            [True] * nr
+-            if force_full
+-            else [
+-                req_id in self._ced_prompt_logprobs for req_id in input_batch.req_ids
+-            ],
+-            [0] * nr
+-            if force_full
+-            else [
+-                self._ced_prefix_start.get(req_id, 0) for req_id in input_batch.req_ids
+-            ],
++            keep_full,
++            prefix_start,
++            limits,
+         )
+         self._ced_batch = input_batch
+ 

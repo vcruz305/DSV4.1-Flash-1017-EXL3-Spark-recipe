@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:00:00 +0000
+Subject: [PATCH] Spec decode: no lookahead past the last logit in the block
+ residual mass
+
+_compute_local_residual_mass_kernel reads draft_sampled[logit_idx + 1],
+one position ahead. Adaptive verification can end a request's block before
+num_speculative_steps, so the last logit of the batch can sit at a draft
+step in [1, num_speculative_steps) and the lookahead reads past the end of
+draft_sampled (a [num_logits] gather). The last logit's residual mass is
+never used (no draft token follows it), so its programs return.
+
+The kernel only runs for block verification with full draft logits
+(draft_sample_method=probabilistic); greedy drafts never launch it.
+
+Port of vllm-project/vllm#60945 ("[Bugfix] Fix out-of-bounds lookahead in
+adaptive block verification") by Chauncey (chaunceyjiang), merged
+2026-10-12 as ac28877f0e86452f2e151279bdc373cd58ae88f0; the same three
+lines, applied to this tree's kernel.
+
+License: Apache-2.0 (dsv41-1017 recipe, DeepSeek-V4.1-Flash-1017-4x-DGX-Spark).
+---
+ vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index e2392252b..9ed13d9cd 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -433,6 +433,9 @@ def _compute_local_residual_mass_kernel(
+     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
+ ):
+     logit_idx = tl.program_id(0).to(tl.int64)
++    # Adaptive verification can end before num_speculative_steps.
++    if logit_idx + 1 >= tl.num_programs(0):
++        return
+     draft_step_idx = tl.load(expanded_local_pos_ptr + logit_idx)
+     if draft_step_idx == 0 or draft_step_idx >= num_speculative_steps:
+         # The acceptance threshold, h, looks one position ahead and sums

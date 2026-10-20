@@ -1,0 +1,75 @@
+DeepSeek-V4.1-Flash-1017 on four DGX Sparks (vLLM)
+
+The scripts, tests, documentation and our patches docker/0001-*.patch to docker/0006-*.patch and
+docker/0008-*.patch (0001-deepseek-v41-reasoning-effort-minimal-medium, 0002-model-loader-weight-snapshots,
+0003-spec-decode-block-residual-mass-lookahead-bound, 0004-spec-decode-block-verification-step-seeds,
+0005-deepseek-v41-ced-skip-unread-nonfinal-chunks, 0006-deepseek-v41-dspark-no-mtp-hidden-buffer,
+0008-v1-engine-persistent-prefix-kv-cache) in this repository are licensed under the Apache License 2.0
+(see LICENSE).
+
+The serving engine is built by docker/Dockerfile from the third-party components below. Each is fetched at
+image build at the pinned commit or digest and patched unmodified; none is redistributed in this repository,
+and each remains under its own license.
+
+- spark-ds41f by Christopher Owen (https://github.com/christopherowen/spark-ds41f), Apache-2.0, at commit
+  2dc95329610188451a5c5f5af98e5c392144809c, release r6w (experiments/2026-10-18-r6w-swiglu): the build preparation
+  (bin/spark), the image recipe (docker/Dockerfile, whose build stages docker/Dockerfile here follows), the
+  patch series for every component below, the serving configuration, and the memguard scripts shipped in
+  the image under /opt/spark-ds41f.
+- vLLM (Apache-2.0, the vLLM project), via Local Inference Lab's fork
+  (https://github.com/local-inference-lab/vllm, branch integration/karmic-kraken-beta, commit
+  19f2c20ed4d64ae22bd009ceacadd85e2a81e354), with spark-ds41f's r6w vLLM series (173 patches: r6v's 172 plus
+  0181, the routed SwiGLU and MXFP8 cast over the live tiles), then spark-ds41f's lossless MoE scale-codes
+  overlay by Christopher Owen (Apache-2.0; commit a250ace70424475c04b0919fc9a46f23c19e51da,
+  experiments/2026-10-18-scale-codes/overlay: vllm/model_executor/layers/fused_moe/tilelang.py and
+  vllm/models/deepseek_v4_1/tilelang/{gemm,moe}.py, copied unmodified and pinned by sha256; the routed
+  experts' scales as row bases and 4-bit codes), then our docker/0003-*.patch to docker/0006-*.patch (two
+  upstream vLLM fixes ported, two prefill savings of ours), then spark-ds41f's DSpark profile-replays overlay
+  by Christopher Owen (Apache-2.0; commit 2ce3644fa361290b0024f0ee784b17b63c8b2882,
+  experiments/2026-10-18-dspark-profile-replays/overlay: vllm/v1/worker/gpu/spec_decode/adaptive_verification.py,
+  copied unmodified and pinned by sha256; adaptive verification's cost curves timed from 25 replays of each
+  graph-captured shape instead of 5), then docker/0007-dspark-adaptive-verification-linear-row-cost-budget.patch:
+  spark-ds41f's vLLM patch 0184 by Christopher Owen (Apache-2.0; commit 03e8775c9f2c9a791bb49a2f4d97575020ec0f7b,
+  experiments/2026-10-18-r6x/vllm; the change of his experiments/2026-10-18-dspark-linear-budget/overlay at
+  commit 53ef3558f4ca56f244cfb1566061199ad9a8975f), his authorship kept, rebased by us onto the tree above (the
+  deleted 25-replay profile resolved to his file; 0006's None guard kept in the model runner): the DSpark draft
+  budget by a fixed linear step cost, the speculative config's adaptive_verification_row_cost in place of the
+  boot-timed cost curves, then our docker/0008-v1-engine-persistent-prefix-kv-cache.patch (the prefix KV
+  cache saved before a stop and restored at start); and the vLLM
+  nightly image docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf
+  (vllm-project/vllm af1c01499b289be555c475669ba50a88e96d846e, CUDA 13.0.2, FlashInfer 0.6.18.post1) as the
+  runtime base.
+- B12X by Luke Alonso and Local Inference Lab contributors (https://github.com/local-inference-lab/b12x,
+  Apache-2.0), commit 236ddff04a5f5064084b46464800b70b34ec7d8c, with spark-ds41f's B12X series (11 patches).
+- TileLang by Tile-AI (https://github.com/tile-ai/tilelang, MIT; its LICENSE notes additional collaboration
+  terms with Microsoft Corporation for December 1, 2024 to March 14, 2025), commit
+  b95ee4ffb52ae26e15619cad38c6f41e7e0a2b46 with its pinned submodules (Apache TVM, Apache-2.0; CUTLASS,
+  BSD-3-Clause; and their own third-party notices), with spark-ds41f's TileLang series (4 patches).
+- TileKernels by DeepSeek (https://github.com/deepseek-ai/TileKernels, MIT), commit
+  66258df6175d2f630ffecb04c5ab66bff8a2ae6a, with spark-ds41f's TileKernels patch (1 patch).
+- sparknet / dgx-spark-networking by Christopher Owen (https://github.com/christopherowen/dgx-spark-networking,
+  Apache-2.0), commit 3bc8d10104a5012244a0424d7dfc1107a72eafab; its one-shot collectives derive from B12X's
+  RoCEnante module (Luke Alonso and Local Inference Lab contributors, Apache-2.0), and its NOTICE credits
+  SparkRing (FujitsuPolycom/sparkring, Apache-2.0) for the mesh4 flow-label mechanism.
+- NCCL by NVIDIA (https://github.com/NVIDIA/nccl, Apache-2.0 with parts under their original BSD license),
+  tag v2.30.7-1 (commit 73cf112295c33aee2b895f329f592f2a9b4b0f97), rebuilt for SM121 with spark-ds41f's NCCL
+  series (4 patches), among them Stanislav Bardyuk's IB send-path acquire fence (NVIDIA/nccl#2393).
+- CUTLASS by NVIDIA (https://github.com/NVIDIA/cutlass, BSD-3-Clause), v4.7.1
+  (commit cb4247394dd82148787aed73e5dc7cef33cbf862), headers for the SM121 vLLM extension rebuild; and the
+  nvidia-cutlass-dsl 4.7.1 wheels from PyPI (NVIDIA, proprietary license), installed hash-locked.
+- DeepSeek-V4.1-Flash-1017 model weights and reference encoder (MIT, DeepSeek), downloaded by
+  `./dsv41.sh fetch`; the image contains no weights.
+
+Patch authors, from the patch headers of the series above: Christopher Owen (all B12X, TileLang and
+TileKernels patches, three of four NCCL patches, and 172 of 173 vLLM patches); carlosmolina0615 (vLLM 0045,
+the CED decoder's MoE routed with its own padding mask in TileLang); Stanislav Bardyuk (NCCL 0001,
+NVIDIA/nccl#2393). The vLLM series credits huxiaofengtiger (NVIDIA Developer Forums) for reported issues,
+and ports vllm-project/vllm#51694. The scale-codes and profile-replays overlays and docker/0007-*.patch (his
+vLLM 0184, rebased) are by Christopher Owen. Our patches (docker/0001-*.patch to docker/0006-*.patch and
+docker/0008-*.patch) are by Justin Casey; 0003 and 0004 port
+vllm-project/vllm#60945 by Chauncey (chaunceyjiang) and vllm-project/vllm#61161 by DimensionSTP (Apache-2.0, the
+vLLM project); 0005 and 0006 change Local Inference Lab's and Christopher Owen's DeepSeek V4.1 code paths, 0005
+after the bounded decoder replay idea of vllm-project/vllm#58132 (ivanium) and #59894 (gcanlin), porting no
+upstream code.
+
+Full credits, including prior art used as inspiration only: README.md, section "Credits".

@@ -11,12 +11,12 @@ MODEL_REPO="vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw"
 # stop resolving. scripts/SHA256SUMS is the authority: download_and_verify.sh
 # falls back to main when this revision is gone, and the sha256 check decides.
 # See README "Pack revision".
-MODEL_REV="${MODEL_REV:-2a6059359c685cd0ea66e1e6c34e6803322ff095}"
+MODEL_REV="${MODEL_REV:-c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960}"
 MODEL_NAME="dsv41-1.62bpw-v3"          # directory name under $MODELS_DIR
 
 # ---- images ---------------------------------------------------------------
 # Base engine: Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329),
-# built per justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark docker/Dockerfile.
+# built by base/docker/Dockerfile (see base/README.md).
 # That Dockerfile's own base is vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf.
 BASE_IMAGE="${BASE_IMAGE:-dsv41-1017-ds41f:r6w}"
 IMAGE="${IMAGE:-dsv41-1017-exl3:r6w}"

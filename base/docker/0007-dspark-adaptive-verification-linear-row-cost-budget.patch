@@ -1,0 +1,1234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 18:43:45 +0200
+Subject: [PATCH] DSpark adaptive verification: budget the drafts by a fixed
+ linear step cost, nothing timed
+
+The draft budget priced extra verification rows from cost curves each build timed
+once at its first boot and pinned, scaled by adaptive_verification_cost_scale.
+Equivalent builds then drafted differently from one timing sample (r6w drafted 3.8%
+fewer tokens a step at sixteen streams than r6v, with identical outputs).
+
+The budget now maximises expected tokens (sampling requests plus the admitted drafts'
+survival probabilities, best first) over 1 + row_cost * rows: the cost model's own
+argmax with its timed curves replaced by one recipe constant, a verification row's
+cost as a fraction of a step's fixed cost (adaptive_verification_row_cost, default
+0.02 from the profiled curves' shape). It is a rule of the inputs, the same on every
+build and boot. The boot profile, the pinned curves and the cost scale are gone; the
+eager shapes past the capture limit still run once at startup, untimed, so their
+kernels compile there.
+
+Christopher Owen's spark-ds41f vLLM patch 0184 (experiments/2026-10-18-r6x/vllm,
+commit 03e8775c9f2c9a791bb49a2f4d97575020ec0f7b; the same three files as his
+experiments/2026-10-18-dspark-linear-budget/overlay at 53ef355), rebased by the
+dsv41-1017 recipe onto r6w with its scale-codes overlay, its patches 0001-0006
+and his 25-replay profile overlay. The one conflict is the 25-replay profile
+code in adaptive_verification.py, which this change deletes; the file is his
+post-patch file byte for byte. model_runner.py keeps 0006's None guard on
+get_mtp_target_hidden_states; everything else is his patch unchanged.
+
+License: Apache-2.0 (spark-ds41f, Copyright Christopher Owen).
+---
+ tests/model_executor/test_b12x_warmup.py      |   9 +-
+ tests/test_config.py                          |  22 -
+ .../spec_decode/test_adaptive_verification.py | 361 +++------------
+ tests/v1/worker/test_mixed_warmup_gate.py     |   7 +-
+ vllm/config/speculative.py                    |  16 +-
+ vllm/v1/worker/gpu/model_runner.py            |  10 +-
+ .../gpu/spec_decode/adaptive_verification.py  | 435 ++----------------
+ 7 files changed, 109 insertions(+), 751 deletions(-)
+
+diff --git a/tests/model_executor/test_b12x_warmup.py b/tests/model_executor/test_b12x_warmup.py
+index 5f4aed317..41dcf611a 100644
+--- a/tests/model_executor/test_b12x_warmup.py
++++ b/tests/model_executor/test_b12x_warmup.py
+@@ -964,7 +964,7 @@ def test_parallel_draft_counts_reach_owners_and_collectives(monkeypatch, query_l
+ 
+ def test_workload_prepares_every_adaptive_verification_profile_shape():
+     from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+-        AdaptiveVerificationManager,
++        preparation_tail_sizes,
+     )
+ 
+     capture_sizes = (1, 2, 4, 8, 16, 24, 32, 48, 64)
+@@ -973,11 +973,8 @@ def test_workload_prepares_every_adaptive_verification_profile_shape():
+     )
+     worker.scheduler_config.max_num_batched_tokens = 4096
+     worker.vllm_config.speculative_config.enable_adaptive_verification = True
+-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+-    manager.req_states = SimpleNamespace(max_num_batched_tokens=4096)
+-    profiled = {
+-        batch["num_tokens"] for batch in manager.batches_to_profile(list(capture_sizes))
+-    }
++    # Startup runs the captured sizes and, once each, the eager tail past them.
++    profiled = {*capture_sizes, *preparation_tail_sizes(capture_sizes, 4096)}
+     tail = {96, 128, 256, 512, 1024, 2048, 4096}
+     assert profiled == {*capture_sizes, *tail}
+     for stage in ("weights", "state"):
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 9a9262056..73210e1c7 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -3489,28 +3489,6 @@ def test_watermarking_forces_model_runner_v2(monkeypatch):
+     )
+ 
+ 
+-@pytest.mark.parametrize("cost_scale", [0.0, -1.0])
+-def test_adaptive_verification_cost_scale_must_be_positive(cost_scale):
+-    with pytest.raises(ValidationError):
+-        SpeculativeConfig(
+-            method="ngram",
+-            num_speculative_tokens=1,
+-            adaptive_verification_cost_scale=cost_scale,
+-        )
+-
+-
+-def test_adaptive_verification_cost_scale_requires_adaptive_dspark():
+-    with pytest.raises(
+-        ValueError,
+-        match="requires DSpark adaptive verification",
+-    ):
+-        SpeculativeConfig(
+-            method="ngram",
+-            num_speculative_tokens=1,
+-            adaptive_verification_cost_scale=2.0,
+-        )
+-
+-
+ @patch("vllm.config.speculative.ModelConfig")
+ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
+     """Regression test: MTP + runai_streamer should use model_weights (original
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index d3e3db171..2a17a5674 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -1,17 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from collections import Counter
+-from contextlib import contextmanager, nullcontext
++from contextlib import nullcontext
+ from types import SimpleNamespace
+ 
+ import numpy as np
+ import pytest
+ import torch
++from pydantic import ValidationError
+ 
++from vllm.config import SpeculativeConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.v1.attention.backend import AttentionCGSupport
+-from vllm.v1.worker.gpu.async_utils import StepTimingSample
+ from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+ from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
+ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+@@ -23,7 +23,7 @@ from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
+ 
+ 
+ def make_manager(
+-    confidences: np.ndarray, verify_cost_ms: np.ndarray
++    confidences: np.ndarray, row_cost: float = 0.02
+ ) -> AdaptiveVerificationManager:
+     num_reqs, num_steps = confidences.shape
+     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+@@ -35,10 +35,9 @@ def make_manager(
+         num_computed_tokens_np=np.ones(num_reqs, dtype=np.int32),
+         prefill_len=SimpleNamespace(np=np.ones(num_reqs, dtype=np.int32)),
+     )
+-    manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
+     manager._max_total_logits = 1 << 30
+     manager.num_bonus_tokens = 1
+-    manager.cost_scale = 1.0
++    manager.row_cost = row_cost
+     return manager
+ 
+ 
+@@ -66,10 +65,11 @@ def test_resolve_adaptive_cudagraph_mode(mode, piecewise_capture_available, expe
+ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+     monkeypatch, world_size, expected_budget
+ ):
+-    # One FP32 ULP across a utility threshold changes the graph's token count.
++    # One FP32 ULP across the budget's decision changes the graph's token count:
++    # at row cost 1 one draft pays exactly when its survival exceeds 0.5.
+     local = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(0.0))]])
+     leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
+-    manager = make_manager(local.numpy().copy(), np.array([1.0, 1.0, 1.5]))
++    manager = make_manager(local.numpy().copy(), row_cost=1.0)
+     manager.req_states.device = torch.device("cpu")
+     manager._confidence_probs = torch.empty_like(local)
+     manager._pending_resets = []
+@@ -238,193 +238,12 @@ def test_glm53_adaptive_manager_accepts_real_target_backends(monkeypatch):
+     assert not B12xMLASparseBackend.supports_device_cpu_query_lens_mismatch()
+ 
+ 
+-def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
+-    # Verification is cheap up to two extra tokens, then jumps 100x; only the
+-    # highest-confidence draft is worth the cheap slot.
+-    manager = make_manager(
+-        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+-        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+-    )
+-
+-    manager.get_num_tokens(
+-        {"low": 3, "high": 3},
+-        {"low": [1, 2], "high": [3, 4]},
+-    )
+-    valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
+-
+-    assert draft_budget == 1
+-    assert valid_drafts == {"low": 2, "high": 2}
+-    assert num_non_draft_tokens == {"low": 1, "high": 1}
+-
+-
+-def test_cost_scale_controls_incremental_verification_cost():
+-    manager = make_manager(
+-        np.array([[0.9, 0.9]], dtype=np.float32),
+-        np.array([1.0, 1.0, 1.5, 2.0]),
+-    )
+-
+-    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
+-
+-    manager.cost_scale = 3.0
+-    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 1
+-
+-
+-def test_profiled_batches_seed_cost_curves_via_consumer():
+-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+-    manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
+-    manager.num_speculative_steps = 7
+-    manager.num_bonus_tokens = 1
+-    curves: dict[str, object] = {}
+-    manager.set_cost_curves = lambda draft, verify, *, verify_curves_by_num_reqs=None: (
+-        curves.update(
+-            draft=draft,
+-            verify=verify,
+-            verify_by_reqs=verify_curves_by_num_reqs,
+-        )
+-    )
+-
+-    timings = [
+-        StepTimingSample(
+-            forward_ms=float(batch["num_tokens"]),
+-            drafter_ms=1.0,
+-            num_target_tokens=batch["num_tokens"],
+-            num_reqs=batch["num_tokens"] // 8,
+-            # Only the captured sizes replay a graph; the tail sizes run eager.
+-            full_cudagraph=batch["num_tokens"] <= 1024,
+-        )
+-        for batch in manager.batches_to_profile([8, 1024])
+-    ]
+-    manager.set_initial_cost_curves(timings)
+-
+-    # Tail beyond the last capture size: 1.5x then doubling to the max.
+-    assert curves["verify"] == [
+-        (8, 8.0),
+-        (1024, 1024.0),
+-        (1536, 1536.0),
+-        (2048, 2048.0),
+-        (4096, 4096.0),
+-    ]
+-    # Eager batches must not contribute to the draft curve: keyed by request
+-    # count they would land inside the captured range and, once made monotonic,
+-    # smear that eager cost across every larger request count.
+-    assert curves["draft"] == [(1, 1.0), (128, 1.0)]
+-    assert curves["verify_by_reqs"] == {1: [(8, 8.0)], 128: [(1024, 1024.0)]}
+-
+-
+-def test_budget_uses_request_specific_full_graph_costs():
+-    manager = make_manager(
+-        np.array([[0.9, 0.9]], dtype=np.float32),
+-        np.array([1.0, 1.0, 100.0, 100.0]),
+-    )
+-    manager.verify_cost_tables_by_num_reqs = {1: np.ones(4)}
+-
+-    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
+-    assert manager._batch_budget is not None
+-    assert manager._batch_budget[2] == 2
+-
+-
+-def test_profile_costs_excludes_each_shapes_cold_run(monkeypatch):
+-    """One-time preparation must not inflate the adaptive verifier's costs."""
+-    # Measure, rather than load pinned curves from a deployment's cost directory.
+-    monkeypatch.setattr(adaptive_module, "_COST_DIR", None)
+-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+-    manager.req_states = SimpleNamespace(max_num_batched_tokens=16)
+-    curves: dict[str, object] = {}
+-    manager.set_cost_curves = lambda draft, verify, **kwargs: curves.update(
+-        draft=draft, verify=verify, **kwargs
+-    )
+-    seen: Counter[tuple[int, int]] = Counter()
+-    measured_shapes = []
+-
+-    class TimingCollector:
+-        def __init__(self):
+-            self.samples = None
+-
+-        @contextmanager
+-        def collect(self):
+-            self.samples = []
+-            try:
+-                yield self.samples
+-            finally:
+-                self.samples = None
+-
+-    timing = TimingCollector()
+-
+-    def run_dummy(num_tokens, context_len, profile_num_reqs=2):
+-        shape = (num_tokens, profile_num_reqs)
+-        cost = 1000.0 if not seen[shape] else float(num_tokens + profile_num_reqs)
+-        seen[shape] += 1
+-        if timing.samples is not None:
+-            measured_shapes.append(shape)
+-            timing.samples.append(
+-                StepTimingSample(
+-                    cost, cost, num_tokens, profile_num_reqs, num_tokens <= 8
+-                )
+-            )
+-
+-    manager.profile_costs(
+-        run_dummy, timing, [1, 2, 8], [(1, 1), (2, 1), (8, 1), (8, 2)]
+-    )
+-
+-    assert curves["verify_curves_by_num_reqs"] == {
+-        1: [(1, 2.0), (2, 3.0), (8, 9.0)],
+-        2: [(8, 10.0)],
+-    }
+-    assert curves["verify"] == [(1, 2.0), (2, 3.0), (8, 9.5), (12, 14.0), (16, 18.0)]
+-    assert curves["draft"] == [(1, 3.0), (2, 10.0)]
+-    # Every shape is sampled in each round instead of consecutive shape blocks.
+-    for start in range(0, len(measured_shapes), len(seen)):
+-        assert set(measured_shapes[start : start + len(seen)]) == set(seen)
+-
+-
+-def test_sparse_full_graph_costs_follow_request_padding(monkeypatch):
+-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+-    manager.req_states = SimpleNamespace(max_num_reqs=32, max_num_batched_tokens=512)
+-    manager._cudagraph_limit = 256
+-    monkeypatch.setattr(
+-        adaptive_module,
+-        "get_tp_group",
+-        lambda: SimpleNamespace(broadcast_object=lambda value, src: value),
+-    )
+-    full_curves = {
+-        1: [(1, 1.0), (2, 1.1), (4, 1.2), (8, 1.3)],
+-        2: [(2, 2.0), (4, 2.1), (8, 2.2), (16, 2.3)],
+-        4: [(4, 4.0)],
+-        8: [(8, 8.0)],
+-        16: [(16, 16.0)],
+-        24: [(24, 24.0)],
+-        32: [(32, 32.0), (64, 64.0), (128, 128.0), (256, 256.0)],
+-    }
+-    manager.set_cost_curves(
+-        [(1, 1.0), (32, 1.0)],
+-        [(8, 1.0), (256, 256.0), (384, 768.0), (512, 1024.0)],
+-        verify_curves_by_num_reqs=full_curves,
+-    )
+-    tables = manager.verify_cost_tables_by_num_reqs
+-    # A four-request graph cannot serve 32 verification rows. Its single
+-    # profiled point must not make every larger padded graph cost 4 ms.
+-    assert tables[4][4] == 4.0
+-    assert tables[4][5] == 8.0
+-    assert tables[4][32] == 32.0
+-    assert tables[16][17] == 24.0
+-    assert tables[24][192] == 256.0
+-    # There is no exact twelve-request graph: use compatible padded shapes.
+-    assert tables[12][12] == 16.0
+-    assert tables[12][25] == 32.0
+-    # Keep the exact C1/C2 specializations and the measured eager tail.
+-    assert tables[1][8] == 1.3
+-    assert tables[2][16] == 2.3
+-    for table in tables.values():
+-        np.testing.assert_array_equal(table[257:], manager.cost_tables[1][257:])
+-
+-
+ def test_compact_batch_preserves_totals_and_bounds():
+     # The CPU placeholder layout must keep the batch total equal to the GPU
+     # total and every verification row within decode_query_len, or downstream
+     # CPU metadata desyncs from the reallocated GPU boundaries.
+     manager = make_manager(
+         np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
+-        np.array([1.0] * 44 + [100.0] * 3),
+     )
+     manager.req_states.req_id_to_index["prefill"] = 2
+     manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
+@@ -449,7 +268,6 @@ def test_budget_caps_at_one_rejection_sampler_chunk():
+     # layout, so the budget must keep total logits within a single chunk.
+     manager = make_manager(
+         np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32),
+-        np.ones(7),
+     )
+     manager._max_total_logits = 3  # 2 bonus logits + at most 1 draft
+     manager.get_num_tokens(
+@@ -472,7 +290,6 @@ def test_zero_budget_rebuilds_cpu_cu_num_logits():
+     # offsets stay uniform rather than skipping non-verification rows.
+     manager = make_manager(
+         np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
+-        np.ones(64),
+     )
+     manager.req_states.req_id_to_index["prefill"] = 2
+     manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
+@@ -510,7 +327,6 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
+     # `num_masks == len(mapping)` assert in apply_grammar_bitmask.
+     manager = make_manager(
+         np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
+-        np.ones(64),
+     )
+     manager.req_states.req_id_to_index["prefill"] = 2
+     manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
+@@ -580,13 +396,11 @@ def _run_tp_confidence_consistency(rank, port):
+                 torch.zeros(3, dtype=torch.int32, device=device),
+                 num_bonus_tokens=1,
+                 max_total_logits=6,
++                # The third draft pays exactly when its survival exceeds 0.24.
++                row_cost=0.24 / 1.56,
+             )
+             manager.add_request(0)
+             manager.add_request(1)
+-            manager.cost_tables = (
+-                np.array([0.0, 0.2, 0.2]),
+-                np.array([0.0, 0.9, 1.0, 1.48, 1.48, 3.0, 3.0]),
+-            )
+             batch = SimpleNamespace(
+                 num_reqs=1,
+                 idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+@@ -611,10 +425,6 @@ def _run_tp_confidence_consistency(rank, port):
+             # A shared total is insufficient: each request's GPU allocation
+             # must agree too, even when local confidence rankings are reversed.
+             manager._max_total_logits = 3
+-            manager.cost_tables = (
+-                np.array([0.0, 0.2, 0.2]),
+-                np.array([0.0, 0.9, 1.0, 1.1, 3.0, 3.0, 3.0]),
+-            )
+             batch = SimpleNamespace(
+                 num_reqs=2,
+                 idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
+@@ -669,7 +479,6 @@ def test_budget_probes_after_steps_without_drafts():
+     """
+     manager = make_manager(
+         np.array([[1e-9, 1e-9]], dtype=np.float32),
+-        np.array([1.0, 2.0, 3.0, 4.0]),
+     )
+     idle = getattr(adaptive_module, "EXPLORE_AFTER_IDLE_STEPS", 32)
+     budgets = []
+@@ -679,118 +488,58 @@ def test_budget_probes_after_steps_without_drafts():
+     assert budgets == ([0] * (idle - 1) + [1]) * 2
+ 
+ 
+-def _pinning_manager() -> AdaptiveVerificationManager:
+-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+-    manager.num_speculative_steps = 3
+-    manager.req_states = SimpleNamespace(max_num_reqs=8, max_num_batched_tokens=64)
+-    manager.curves = {}
+-    manager.set_cost_curves = lambda draft, verify, **kwargs: manager.curves.update(
+-        draft=draft, verify=verify, **kwargs
++def test_budget_admits_the_drafts_that_pay_for_their_rows():
++    # Survival is the running product of a request's confidences: low 0.1, 0.01;
++    # high 0.9, 0.81. Two sampling requests, two non-draft rows; at row cost 0.2
++    # expected tokens per unit cost peak with the high request's two drafts.
++    manager = make_manager(
++        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32), row_cost=0.2
+     )
+-    return manager
+-
+ 
+-def _tp_group(rank: int, answer=lambda value: value):
+-    return SimpleNamespace(
+-        rank_in_group=rank,
+-        world_size=3,
+-        broadcast_object=lambda value, src: answer(value),
++    manager.get_num_tokens(
++        {"low": 3, "high": 3},
++        {"low": [1, 2], "high": [3, 4]},
+     )
++    valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
+ 
++    assert draft_budget == 2
++    assert valid_drafts == {"low": 2, "high": 2}
++    assert num_non_draft_tokens == {"low": 1, "high": 1}
+ 
+-_CAPTURE_SIZES = [1, 2, 8]
+-_FULL_SHAPES = [(1, 1), (2, 1), (8, 1), (8, 2)]
+ 
++@pytest.mark.parametrize(("row_cost", "budget"), [(0.02, 2), (5.0, 1), (20.0, 0)])
++def test_row_cost_alone_sets_the_budget(row_cost, budget):
++    manager = make_manager(np.array([[0.9, 0.9]], dtype=np.float32), row_cost)
++    tokens = manager.get_num_tokens({"low": 3}, {"low": [1, 2]})
++    assert manager._batch_budget[2] == budget
++    assert tokens == 1 + budget
+ 
+-def _profile(manager: AdaptiveVerificationManager, cost: float = 1.0):
+-    """profile_costs on fake dummy runs; returns (shape, timed) per run."""
+-    runs = []
+ 
+-    class TimingCollector:
+-        samples = None
+-
+-        @contextmanager
+-        def collect(self):
+-            self.samples = []
+-            try:
+-                yield self.samples
+-            finally:
+-                self.samples = None
+-
+-    timing = TimingCollector()
+-
+-    def run_dummy(num_tokens, context_len, profile_num_reqs=None):
+-        runs.append(((num_tokens, profile_num_reqs), timing.samples is not None))
+-        if timing.samples is not None:
+-            num_reqs = profile_num_reqs or min(num_tokens, 8)
+-            timing.samples.append(
+-                StepTimingSample(
+-                    cost * num_tokens,
+-                    cost,
+-                    num_tokens,
+-                    num_reqs,
+-                    full_cudagraph=profile_num_reqs is not None,
+-                )
+-            )
++@pytest.mark.parametrize("row_cost", [0.0, -0.5, 1.0, 1.5])
++def test_adaptive_verification_row_cost_is_a_fraction(row_cost):
++    with pytest.raises(ValidationError):
++        SpeculativeConfig(
++            method="ngram",
++            num_speculative_tokens=1,
++            adaptive_verification_row_cost=row_cost,
++        )
+ 
+-    manager.profile_costs(run_dummy, timing, _CAPTURE_SIZES, _FULL_SHAPES)
+-    return runs
+-
+-
+-def test_pinned_cost_curves_skip_the_profile(monkeypatch, tmp_path):
+-    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
+-    monkeypatch.setattr(adaptive_module, "get_tp_group", lambda: _tp_group(0))
+-    first = _pinning_manager()
+-    runs = _profile(first)
+-    assert any(timed for _, timed in runs)
+-    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 1
+-
+-    # A later boot with the same shapes reads the first profile and times
+-    # nothing; only the shapes past the capture limit run, once.
+-    second = _pinning_manager()
+-    runs = _profile(second, cost=9.0)
+-    assert runs == [((n, None), False) for n in (12, 16, 32, 64)]
+-    assert second.curves == first.curves
+-
+-    # Other shapes get their own profile and file.
+-    third = _pinning_manager()
+-    third.req_states.max_num_batched_tokens = 128
+-    assert any(timed for _, timed in _profile(third))
+-    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 2
+-
+-
+-def test_pin_key_names_the_profiled_shapes(monkeypatch, tmp_path):
+-    """The key computed before profiling is the one the curves imply, so
+-    tables pinned from a profile keep matching."""
+-    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
+-    monkeypatch.setattr(adaptive_module, "get_tp_group", lambda: _tp_group(0))
+-    manager = _pinning_manager()
+-    _profile(manager)
+-    key = manager._pin_key(_CAPTURE_SIZES, _FULL_SHAPES)
+-    curves = manager.curves
+-    assert key["draft_sizes"] == [x for x, _ in curves["draft"]]
+-    assert key["verify_sizes"] == [x for x, _ in curves["verify"]]
+-    assert key["full_shapes"] == {
+-        str(n): [x for x, _ in curve]
+-        for n, curve in sorted(curves["verify_curves_by_num_reqs"].items())
+-    }
+-
+-
+-def test_pinned_cost_curves_only_from_rank_zero(monkeypatch, tmp_path):
+-    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
+-    # Without rank 0's curves, rank 1 profiles but never writes.
+-    monkeypatch.setattr(
+-        adaptive_module, "get_tp_group", lambda: _tp_group(1, lambda value: None)
+-    )
+-    assert any(timed for _, timed in _profile(_pinning_manager()))
+-    assert not list(tmp_path.iterdir())
+ 
+-    # With them, it skips the profile like rank 0, whatever it holds itself.
+-    pinned = ([[1, 2.0]], [[4, 40.0]], {"1": [[4, 40.0]]})
+-    monkeypatch.setattr(
+-        adaptive_module, "get_tp_group", lambda: _tp_group(1, lambda value: pinned)
+-    )
+-    manager = _pinning_manager()
+-    assert not any(timed for _, timed in _profile(manager))
+-    assert manager.curves["draft"] == [(1, 2.0)]
+-    assert manager.curves["verify_curves_by_num_reqs"] == {1: [(4, 40.0)]}
++def test_adaptive_verification_row_cost_requires_adaptive_dspark():
++    with pytest.raises(
++        ValueError,
++        match="requires DSpark adaptive verification",
++    ):
++        SpeculativeConfig(
++            method="ngram",
++            num_speculative_tokens=1,
++            adaptive_verification_row_cost=0.03,
++        )
++
++
++def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
++    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
++    manager.req_states = SimpleNamespace(max_num_batched_tokens=1024)
++    runs = []
++    manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
++    assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
+diff --git a/tests/v1/worker/test_mixed_warmup_gate.py b/tests/v1/worker/test_mixed_warmup_gate.py
+index 04f456a7c..c62ea9446 100644
+--- a/tests/v1/worker/test_mixed_warmup_gate.py
++++ b/tests/v1/worker/test_mixed_warmup_gate.py
+@@ -34,11 +34,14 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
+ @pytest.mark.parametrize("fail_warmup", [False, True])
+ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_warmup):
+     """Startup must warm fixed drafts before calibration and retain its manager."""
+-    manager = SimpleNamespace(cost_tables=None)
++    manager = SimpleNamespace(row_cost=0.02)
+     rejection_sampler = SimpleNamespace(enable_adaptive_verification=True)
+     runner = SimpleNamespace(
+         adaptive_verification=manager,
+         rejection_sampler=rejection_sampler,
++        # A sharded runner skips the dead-row kernel warmup, which needs a real
++        # runner's buffers; this test is about restoring the adaptive manager.
++        batch_sharder=object(),
+     )
+ 
+     def run_steps(model_runner, execute, sample):
+@@ -54,5 +57,5 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
+     else:
+         warmup.warmup_kernels(runner, _fail, _fail)
+     assert runner.adaptive_verification is manager
+-    assert manager.cost_tables is None
++    assert manager.row_cost == 0.02
+     assert rejection_sampler.enable_adaptive_verification
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index de05f7a38..afb12e802 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -558,11 +558,13 @@ class SpeculativeConfig:
+     """Whether to adaptively size the draft-verification budget from per-request
+     confidence. Currently only supported for method="dspark"."""
+ 
+-    adaptive_verification_cost_scale: float = Field(default=1.0, gt=0.0)
+-    """Scale the incremental target-verification cost used by DSpark adaptive
+-    verification. Values above 1.0 trim more aggressively; values below 1.0
+-    retain more drafts. The unavoidable zero-draft verification cost is not
+-    scaled."""
++    adaptive_verification_row_cost: float = Field(default=0.02, gt=0.0, lt=1.0)
++    """DSpark adaptive verification sizes each step's draft budget to maximise
++    expected tokens (sampling requests plus the admitted drafts' survival
++    probabilities) per unit of step cost, the cost being ``1 + row_cost * rows``:
++    this is one verification row's cost as a fraction of a step's fixed cost.
++    A recipe constant, so the draft schedule is a rule of the inputs, the same
++    on every build and boot, with no measured costs."""
+ 
+     @staticmethod
+     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
+@@ -1720,11 +1722,11 @@ class SpeculativeConfig:
+                 "materializes. Disable one of them."
+             )
+ 
+-        if self.adaptive_verification_cost_scale != 1.0 and (
++        if self.adaptive_verification_row_cost != 0.02 and (
+             self.method != "dspark" or not self.enable_adaptive_verification
+         ):
+             raise ValueError(
+-                "adaptive_verification_cost_scale requires DSpark adaptive verification"
++                "adaptive_verification_row_cost requires DSpark adaptive verification"
+             )
+ 
+         if (
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ce0e0b654..66500006d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -753,10 +753,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
+             max_total_logits=get_max_chunk_logits(self.vocab_size),
+             vllm_config=self.vllm_config,
+-            adaptive_verification_cost_scale=(
+-                self.speculative_config.adaptive_verification_cost_scale
++            adaptive_verification_row_cost=(
++                self.speculative_config.adaptive_verification_row_cost
+                 if self.speculative_config is not None
+-                else 1.0
++                else 0.02
+             ),
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
+@@ -1398,11 +1398,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         with use_workspace_lane(self._draft_workspace_lane):
+                             self.speculator.capture()
+                     if self.adaptive_verification is not None:
+-                        self.adaptive_verification.profile_costs(
++                        self.adaptive_verification.warm_tail_shapes(
+                             self._dummy_run,
+-                            self.step_timing,
+                             self.cudagraph_manager.captured_token_counts(),
+-                            self.cudagraph_manager.captured_full_batch_shapes(),
+                         )
+                         self.adaptive_verification.load_draft_budget_kernels()
+                     self.kv_connector.reset_capture_state()
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index f6b851603..99ac95e0f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -2,17 +2,13 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Adaptive verification for DSpark speculative decoding."""
+ 
+-import hashlib
+-import json
+ import os
+-from collections import defaultdict
+-from collections.abc import Callable, Iterable, Iterator, Mapping
++from collections.abc import Callable, Iterable
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ import torch
+ 
+-import vllm.envs as envs
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed.parallel_state import get_tp_group
+ from vllm.logger import init_logger
+@@ -20,7 +16,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.attention.backend import AttentionCGSupport
+ from vllm.v1.utils import CpuGpuBuffer
+-from vllm.v1.worker.gpu.async_utils import StepTimingCollector, StepTimingSample, stream
++from vllm.v1.worker.gpu.async_utils import stream
+ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+     get_query_lens_mismatch_unsupported_backend,
+@@ -28,18 +24,6 @@ from vllm.v1.worker.gpu.attn_utils import (
+ from vllm.v1.worker.gpu.input_batch import DeadRows
+ 
+ logger = init_logger(__name__)
+-# Timed replays of each graph-captured shape (decode and verification, where
+-# the draft budget's marginal costs come from) and of each eager shape past the
+-# capture limit (prefill-sized, a second or more each, and priced as a whole).
+-# A median of 5 left slopes between neighbouring shapes several percent apart
+-# from one build to the next; 25 cuts that noise by more than half for a few
+-# seconds of a build's first boot.
+-_PROFILE_REPLAYS = 25
+-_TAIL_REPLAYS = 5
+-# Directory of pinned cost curves: rank 0 saves the first profile of a shape
+-# set, and later boots with the same shapes read it instead of profiling, so
+-# the draft budget does not depend on one boot's startup timing noise.
+-_COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
+ # Dead rows: verification rows past the first draft whose survival (running
+ # product of this step's confidences) falls below this threshold are marked
+ # as padding, so routed MoE skips them, and the request commits at most one
+@@ -105,56 +89,10 @@ def _assign_draft_token_budget(
+     torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
+ 
+ 
+-def build_cost_tables_from_curves(
+-    draft_curve: list[tuple[int, float]],
+-    verify_curve: list[tuple[int, float]],
+-    max_num_reqs: int,
+-    max_batch_tokens: int,
+-    cudagraph_limit: int = 0,
+-) -> tuple[np.ndarray, np.ndarray]:
+-    """Build cost tables: graph-padded below the capture limit, smooth above.
+-
+-    Args:
+-        cudagraph_limit: Largest cudagraph-captured size. At or below it,
+-            execution pads up to the next captured size, so cost is a step
+-            function. Above it there is no padding, so cost is continuous.
+-    """
+-
+-    def build_table(limit: int, curve: list[tuple[int, float]]) -> np.ndarray:
+-        xs, ys = np.asarray(curve, dtype=np.float64).T
+-        ys = np.maximum.accumulate(ys)
+-        values = np.arange(limit + 1)
+-        # Execution pads to the next captured size, so cost is a step
+-        # function of the padded size: smooth interpolation would invent
+-        # marginal per-token costs that don't exist within a pad bucket.
+-        idx = np.searchsorted(xs, values, side="left")
+-        result = ys[np.minimum(idx, len(xs) - 1)]
+-        # Past the capture limit nothing pads, so cost really is continuous in
+-        # size; snapping to the next profiled point overestimates badly when
+-        # the profiled points are far apart. Interpolate only between points
+-        # that are themselves past the limit: crossing the limit loses
+-        # cudagraphs entirely, which is a genuine discontinuity, so the first
+-        # point above it must not be blended with the last one below.
+-        if cudagraph_limit:
+-            smooth = values > cudagraph_limit
+-            above = xs > cudagraph_limit
+-            if smooth.any() and above.any():
+-                result[smooth] = np.interp(values[smooth], xs[above], ys[above])
+-        if len(xs) > 1:
+-            after = values > xs[-1]
+-            slope = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+-            result[after] = ys[-1] + slope * (values[after] - xs[-1])
+-        return result
+-
+-    draft_table = np.maximum(build_table(max_num_reqs, draft_curve), 0.0)
+-    verify_table = np.maximum(build_table(max_batch_tokens, verify_curve), 1e-6)
+-    return draft_table, verify_table
+-
+-
+ def preparation_tail_sizes(
+     capture_sizes: Iterable[int], max_num_tokens: int
+ ) -> tuple[int, ...]:
+-    """Exact eager token counts used to initialize adaptive verification costs."""
++    """Exact eager token counts past the capture limit, warmed once at startup."""
+     capture_sizes = tuple(capture_sizes)
+     size = capture_sizes[-1] if capture_sizes else 0
+     tail_sizes = set()
+@@ -174,7 +112,7 @@ class AdaptiveVerificationManager:
+         query_start_loc: torch.Tensor,
+         num_bonus_tokens: int,
+         max_total_logits: int,
+-        cost_scale: float = 1.0,
++        row_cost: float,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -186,7 +124,10 @@ class AdaptiveVerificationManager:
+         # chunked path indexes by scheduled (untrimmed) offsets and cannot
+         # address the compacted layout, so the budget must fit one chunk.
+         self._max_total_logits = max_total_logits
+-        self.cost_scale = cost_scale
++        # The cost of one more verification row as a fraction of a step's fixed
++        # cost: a recipe constant, so the budget is a rule of the inputs, the same
++        # on every build and boot, with nothing timed.
++        self.row_cost = row_cost
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+@@ -196,9 +137,6 @@ class AdaptiveVerificationManager:
+                 "DSpark dead verification rows below survival %.3g", self.dead_rows_tau
+             )
+         self.query_start_loc = query_start_loc
+-        self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
+-        # Largest cudagraph-captured token count; above it nothing pads.
+-        self._cudagraph_limit = 0
+         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+         max_num_reqs = req_states.max_num_reqs
+         # Current per-slot confidences
+@@ -234,84 +172,14 @@ class AdaptiveVerificationManager:
+         self._pending_resets.append(req_idx)
+         self._confidence_probs[req_idx].fill_(1.0)
+ 
+-    def batches_to_profile(
+-        self,
+-        capture_sizes: list[int],
+-        full_batch_shapes: list[tuple[int, int]] | None = None,
+-        *,
+-        replays: int | None = None,
+-    ) -> Iterator[dict[str, int]]:
+-        """Dummy-run kwargs whose step timings seed the cost tables.
+-
+-        Run these inside StepTimingCollector.collect(), then hand the block's
+-        timings to set_initial_cost_curves. FULL graph shapes retain request
+-        count because adaptive verification costs differ materially across the
+-        dense low-concurrency specializations.
+-        """
+-        replays = _PROFILE_REPLAYS if replays is None else replays
+-        max_num_tokens = self.req_states.max_num_batched_tokens
+-        self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
+-        graph_shapes: list[tuple[int, int | None]]
+-        if full_batch_shapes is None:
+-            graph_shapes = [(num_tokens, None) for num_tokens in capture_sizes]
+-        else:
+-            graph_shapes = list(full_batch_shapes)
+-
+-        # Also profile beyond the capture limit: real steps run there
+-        # (piecewise/eager) and linear extrapolation badly underestimates
+-        # them. These runs double as JIT warmup for the piecewise shapes.
+-        tail_shapes: list[tuple[int, int | None]] = [
+-            (num_tokens, None)
+-            for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens)
+-        ]
+-        for replay in range(replays):
+-            profile_shapes = graph_shapes + (
+-                tail_shapes if replay < min(replays, _TAIL_REPLAYS) else []
+-            )
+-            shapes = profile_shapes if replay % 2 == 0 else reversed(profile_shapes)
+-            for num_tokens, num_reqs in shapes:
+-                batch = {
+-                    "num_tokens": num_tokens,
+-                    "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+-                }
+-                if num_reqs is not None:
+-                    batch["profile_num_reqs"] = num_reqs
+-                yield batch
+-
+-    def profile_costs(
+-        self,
+-        run_dummy: Callable[..., object],
+-        step_timing: StepTimingCollector,
+-        capture_sizes: list[int],
+-        full_batch_shapes: list[tuple[int, int]],
++    def warm_tail_shapes(
++        self, run_dummy: Callable[..., object], capture_sizes: list[int]
+     ) -> None:
+-        """Price the shapes from pinned curves, or profile them.
+-
+-        A profile warms every shape, then samples rounds to limit startup and
+-        order bias. Pinned curves for the shape set skip it; the shapes past
+-        the capture limit, which run without graphs, still run once so their
+-        kernels compile before the first long prefill does.
+-        """
+-        key = self._pin_key(capture_sizes, full_batch_shapes)
+-        pinned = self._load_pinned_curves(key)
+-        if pinned is not None:
+-            for batch in self.batches_to_profile(capture_sizes, [], replays=1):
+-                run_dummy(**batch)
+-            draft_curve, verify_curve, verify_curves_by_num_reqs = pinned
+-            self.set_cost_curves(
+-                draft_curve,
+-                verify_curve,
+-                verify_curves_by_num_reqs=verify_curves_by_num_reqs,
+-            )
+-            return
+-        for batch in self.batches_to_profile(
+-            capture_sizes, full_batch_shapes, replays=1
+-        ):
+-            run_dummy(**batch)
+-        with step_timing.collect() as timings:
+-            for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
+-                run_dummy(**batch)
+-        self.set_initial_cost_curves(timings, pin_key=key)
++        """Run each eager token count past the capture limit once, untimed, so its
++        kernels compile before the first long prefill does."""
++        max_num_tokens = self.req_states.max_num_batched_tokens
++        for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens):
++            run_dummy(num_tokens=num_tokens)
+ 
+     def load_draft_budget_kernels(self) -> None:
+         """Run the draft-budget selection once at its smallest and largest shapes,
+@@ -336,228 +204,6 @@ class AdaptiveVerificationManager:
+             )
+         torch.cuda.synchronize(device)
+ 
+-    def set_initial_cost_curves(
+-        self, samples: list[StepTimingSample], pin_key: dict | None = None
+-    ) -> None:
+-        def median_curve(
+-            points: Iterable[tuple[int, float]],
+-        ) -> list[tuple[int, float]]:
+-            grouped: defaultdict[int, list[float]] = defaultdict(list)
+-            for key, value in points:
+-                grouped[key].append(value)
+-            return [(k, float(np.median(v))) for k, v in sorted(grouped.items())]
+-
+-        # Draft curve: eager-target steps inflate drafter timings (the CPU is
+-        # still launching kernels, opening gaps between the drafter's events),
+-        # and request counts — unlike token counts — collide across execution
+-        # modes, so only graph-replay samples may price the draft curve.
+-        draft_curve = median_curve(
+-            (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
+-        )
+-        verify_curve = median_curve(
+-            (s.num_target_tokens, s.forward_ms) for s in samples
+-        )
+-        verify_curves_by_num_reqs = {
+-            num_reqs: median_curve(
+-                (s.num_target_tokens, s.forward_ms)
+-                for s in samples
+-                if s.full_cudagraph and s.num_reqs == num_reqs
+-            )
+-            for num_reqs in sorted({s.num_reqs for s in samples if s.full_cudagraph})
+-        }
+-        if pin_key is not None:
+-            self._save_pinned_curves(
+-                pin_key, draft_curve, verify_curve, verify_curves_by_num_reqs
+-            )
+-        self.set_cost_curves(
+-            draft_curve,
+-            verify_curve,
+-            verify_curves_by_num_reqs=verify_curves_by_num_reqs,
+-        )
+-
+-    def _pin_key(
+-        self,
+-        capture_sizes: list[int],
+-        full_batch_shapes: list[tuple[int, int]],
+-    ) -> dict | None:
+-        """The pinned-curve key of a shape set, or None without a cost directory.
+-
+-        Configuration only, so a boot looks its curves up before profiling:
+-        TP size, draft count, request and token limits, capture limit, profile
+-        context length, the replay counts, and the shapes a profile would time,
+-        listed as its curves list them (drafter by FULL graph request count,
+-        verification by token count, FULL graph token counts by request count).
+-        """
+-        if _COST_DIR is None or not full_batch_shapes:
+-            return None
+-        tokens_by_num_reqs: defaultdict[int, list[int]] = defaultdict(list)
+-        for num_tokens, num_reqs in sorted(full_batch_shapes):
+-            tokens_by_num_reqs[num_reqs].append(num_tokens)
+-        max_num_tokens = self.req_states.max_num_batched_tokens
+-        tail = preparation_tail_sizes(capture_sizes, max_num_tokens)
+-        return {
+-            "tp": get_tp_group().world_size,
+-            "num_speculative_steps": self.num_speculative_steps,
+-            "max_num_reqs": self.req_states.max_num_reqs,
+-            "max_num_batched_tokens": max_num_tokens,
+-            "cudagraph_limit": capture_sizes[-1] if capture_sizes else 0,
+-            "profile_context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+-            # Curves timed with fewer replays are not reused.
+-            "profile_replays": [_PROFILE_REPLAYS, _TAIL_REPLAYS],
+-            "draft_sizes": sorted(tokens_by_num_reqs),
+-            "verify_sizes": sorted({n for n, _ in full_batch_shapes} | set(tail)),
+-            "full_shapes": {
+-                str(n): tokens for n, tokens in sorted(tokens_by_num_reqs.items())
+-            },
+-        }
+-
+-    @staticmethod
+-    def _pin_path(key: dict) -> str:
+-        assert _COST_DIR is not None
+-        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+-        return os.path.join(_COST_DIR, f"dspark-costs-{digest[:16]}.json")
+-
+-    def _load_pinned_curves(
+-        self, key: dict | None
+-    ) -> (
+-        tuple[
+-            list[tuple[int, float]],
+-            list[tuple[int, float]],
+-            dict[int, list[tuple[int, float]]],
+-        ]
+-        | None
+-    ):
+-        """Rank 0's pinned curves for this key, or None to profile.
+-
+-        Rank 0 reads the file and broadcasts the answer, so every rank either
+-        profiles or skips the profile, and their collectives match.
+-        """
+-        if key is None:
+-            return None
+-        tp_group = get_tp_group()
+-        pinned = None
+-        if tp_group.rank_in_group == 0:
+-            path = self._pin_path(key)
+-            if os.path.exists(path):
+-                with open(path) as f:
+-                    saved = json.load(f)
+-                if saved.get("key") == key:
+-                    logger.info("Using pinned DSpark cost curves from %s", path)
+-                    pinned = (
+-                        saved["draft_curve"],
+-                        saved["verify_curve"],
+-                        saved["verify_curves_by_num_reqs"],
+-                    )
+-                else:
+-                    logger.warning(
+-                        "Ignoring pinned DSpark cost curves with another key: %s", path
+-                    )
+-        pinned = tp_group.broadcast_object(pinned, src=0)
+-        if pinned is None:
+-            return None
+-        draft_curve, verify_curve, verify_curves_by_num_reqs = pinned
+-        return (
+-            [tuple(p) for p in draft_curve],
+-            [tuple(p) for p in verify_curve],
+-            {
+-                int(n): [tuple(p) for p in curve]
+-                for n, curve in verify_curves_by_num_reqs.items()
+-            },
+-        )
+-
+-    def _save_pinned_curves(
+-        self,
+-        key: dict,
+-        draft_curve: list[tuple[int, float]],
+-        verify_curve: list[tuple[int, float]],
+-        verify_curves_by_num_reqs: Mapping[int, list[tuple[int, float]]],
+-    ) -> None:
+-        """Pin rank 0's profile for later boots with the same shape set."""
+-        if get_tp_group().rank_in_group != 0:
+-            return
+-
+-        def plain(curve: list[tuple[int, float]]) -> list[list[int | float]]:
+-            return [[int(x), float(y)] for x, y in curve]
+-
+-        path = self._pin_path(key)
+-        os.makedirs(os.path.dirname(path), exist_ok=True)
+-        tmp = f"{path}.{os.getpid()}.tmp"
+-        with open(tmp, "w") as f:
+-            json.dump(
+-                {
+-                    "key": key,
+-                    "profile_replays": [_PROFILE_REPLAYS, _TAIL_REPLAYS],
+-                    "draft_curve": plain(draft_curve),
+-                    "verify_curve": plain(verify_curve),
+-                    "verify_curves_by_num_reqs": {
+-                        str(n): plain(curve)
+-                        for n, curve in verify_curves_by_num_reqs.items()
+-                    },
+-                },
+-                f,
+-                indent=1,
+-            )
+-        os.replace(tmp, path)
+-        logger.info("Pinned DSpark cost curves to %s", path)
+-
+-    def set_cost_curves(
+-        self,
+-        draft_curve: list[tuple[int, float]],
+-        verify_curve: list[tuple[int, float]],
+-        *,
+-        verify_curves_by_num_reqs: Mapping[int, list[tuple[int, float]]] | None = None,
+-    ) -> None:
+-        draft_curve, verify_curve, verify_curves_by_num_reqs = (
+-            get_tp_group().broadcast_object(
+-                (draft_curve, verify_curve, verify_curves_by_num_reqs), src=0
+-            )
+-        )
+-        if not draft_curve or not verify_curve:
+-            raise RuntimeError(
+-                "Adaptive verification could not profile step costs. Pass "
+-                "`enable_adaptive_verification=false` in the speculative config to "
+-                "verify a fixed number of drafts instead."
+-            )
+-        max_num_reqs = self.req_states.max_num_reqs
+-        max_batch_tokens = self.req_states.max_num_batched_tokens
+-        self.cost_tables = build_cost_tables_from_curves(
+-            draft_curve,
+-            verify_curve,
+-            max_num_reqs,
+-            max_batch_tokens,
+-            self._cudagraph_limit,
+-        )
+-        # FULL replay pads both tokens and requests. A request count may have
+-        # only one exact shape; extending that point prices all larger graphs
+-        # as free verification. Follow the smallest compatible padded shape.
+-        full_shapes = sorted(
+-            (num_tokens, padded_reqs, cost)
+-            for padded_reqs, curve in (verify_curves_by_num_reqs or {}).items()
+-            for num_tokens, cost in curve
+-        )
+-        self.verify_cost_tables_by_num_reqs = {}
+-        for num_reqs in range(1, max_num_reqs + 1):
+-            curve: dict[int, float] = {}
+-            for num_tokens, padded_reqs, cost in full_shapes:
+-                if padded_reqs >= num_reqs:
+-                    curve.setdefault(num_tokens, cost)
+-            if not curve:
+-                continue
+-            xs = np.asarray(list(curve))
+-            ys = np.maximum.accumulate(list(curve.values()))
+-            limit = min(int(xs[-1]), max_batch_tokens)
+-            table = self.cost_tables[1].copy()
+-            table[: limit + 1] = np.maximum(
+-                ys[np.searchsorted(xs, np.arange(limit + 1), side="left")], 1e-6
+-            )
+-            # Beyond the captured shapes, retain the measured eager costs.
+-            self.verify_cost_tables_by_num_reqs[num_reqs] = table
+-        logger.debug(
+-            "DSpark cost tables: %s; per-request verify tables: %s",
+-            self.cost_tables,
+-            self.verify_cost_tables_by_num_reqs,
+-        )
+-
+     def record_confidences(
+         self,
+         confidence_probs: torch.Tensor,
+@@ -599,10 +245,13 @@ class AdaptiveVerificationManager:
+     ) -> int:
+         """Token count once the draft budget is trimmed to fit.
+ 
+-        Stashes the chosen budget in ``_batch_budget`` for the compaction and
++        The budget maximises expected tokens per unit of step cost: the step's
++        sampling requests plus the survival probabilities of the admitted draft
++        slots (best first), over ``1 + row_cost * rows``, where ``rows`` counts
++        the step's non-draft rows and admitted draft rows; within the one-chunk
++        logits limit. Stashes it in ``_batch_budget`` for the compaction and
+         reallocation that follow in the same step.
+         """
+-        assert self.cost_tables is not None
+         req_ids = list(num_tokens_per_req)
+         num_reqs = len(req_ids)
+         scheduled_tokens = np.fromiter(
+@@ -624,34 +273,11 @@ class AdaptiveVerificationManager:
+         steps = np.arange(self.num_speculative_steps)
+         valid = steps[None, :] < scheduled_drafts[:, None]
+         scores = np.sort(survival_probability[valid])[::-1]
+-        num_non_draft_tokens_total = int(num_non_draft_tokens.sum())
+         max_draft_budget = min(
+             int(scheduled_drafts.sum()),
+             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+         )
+         scores = scores[:max_draft_budget]
+-        draft_cost_ms, verify_cost_ms = self.cost_tables
+-        verify_cost_ms = getattr(self, "verify_cost_tables_by_num_reqs", {}).get(
+-            num_reqs, verify_cost_ms
+-        )
+-        num_sampling_requests = np.count_nonzero(
+-            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
+-            >= self.req_states.prefill_len.np[slots]
+-        )
+-        num_tokens_to_estimated_accepted_tokens = np.concatenate(
+-            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+-        )
+-        verify_costs = verify_cost_ms[
+-            num_non_draft_tokens_total : num_non_draft_tokens_total
+-            + max_draft_budget
+-            + 1
+-        ]
+-        base_verify_cost = verify_costs[0]
+-        costs = (
+-            draft_cost_ms[len(req_ids)]
+-            + base_verify_cost
+-            + self.cost_scale * (verify_costs - base_verify_cost)
+-        )
+         num_drafts_per_req = {
+             req_id: int(num_drafts)
+             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
+@@ -660,7 +286,15 @@ class AdaptiveVerificationManager:
+             req_id: int(num_tokens)
+             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
+         }
+-        utilities = num_tokens_to_estimated_accepted_tokens / costs
++        num_sampling_requests = np.count_nonzero(
++            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
++            >= self.req_states.prefill_len.np[slots]
++        )
++        expected_tokens = np.concatenate(
++            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
++        )
++        rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
++        utilities = expected_tokens / (1.0 + self.row_cost * rows)
+         draft_budget = int(np.argmax(utilities))
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+@@ -677,14 +311,11 @@ class AdaptiveVerificationManager:
+         self._steps_without_drafts = idle
+         logger.debug(
+             "DSpark adaptive verification selected %d/%d draft rows for %d "
+-            "requests at cost scale %.3g (selected utility %.4g, full utility "
+-            "%.4g)",
++            "requests at row cost %.3g",
+             draft_budget,
+             int(scheduled_drafts.sum()),
+             num_reqs,
+-            self.cost_scale,
+-            utilities[draft_budget],
+-            utilities[-1],
++            self.row_cost,
+         )
+         self._batch_budget = (
+             num_drafts_per_req,
+@@ -820,7 +451,7 @@ def maybe_create_adaptive_verification_manager(
+     num_bonus_tokens: int,
+     max_total_logits: int,
+     vllm_config: "VllmConfig",
+-    adaptive_verification_cost_scale: float = 1.0,
++    adaptive_verification_row_cost: float = 0.02,
+     target_layer_names: set[str] | None = None,
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+ ) -> AdaptiveVerificationManager | None:
+@@ -889,5 +520,5 @@ def maybe_create_adaptive_verification_manager(
+         query_start_loc,
+         num_bonus_tokens,
+         max_total_logits=max_total_logits,
+-        cost_scale=adaptive_verification_cost_scale,
++        row_cost=adaptive_verification_row_cost,
+     )

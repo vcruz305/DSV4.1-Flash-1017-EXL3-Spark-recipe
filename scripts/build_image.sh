@@ -16,13 +16,12 @@ if ! sudo -n docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
   cat >&2 <<EOF
 Base image $BASE_IMAGE is not present.
 
-Build it once from justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark:
+Build it once from the files in base/ (CPU only, several hours; see base/README.md):
 
-  git clone https://github.com/justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark.git
-  cd DeepSeek-V4.1-Flash-1017-4x-DGX-Spark
-  sudo docker build -f docker/Dockerfile -t $BASE_IMAGE .
+  sudo docker build --platform linux/arm64 -f "$RECIPE_HOME/base/docker/Dockerfile" -t $BASE_IMAGE "$RECIPE_HOME/base"
 
-That image is Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329).
+That image is Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329) with the
+patches listed in base/NOTICE.
 EOF
   exit 1
 fi
