@@ -2,9 +2,8 @@
 # In-container serve script. This is the measured invocation; every flag below
 # was in the run that produced the numbers in README.md.
 #
-# Do not add --enforce-eager (that is the 74.4 ms/token no-draft path), do not
-# enable prefix caching (measured off), and do not raise --max-num-batched-tokens
-# past 2112 (8192 does not fit; see docs/ENGINEERING_NOTES.md).
+# Do not add --enforce-eager (that is the 74.4 ms/token no-draft path) and do not
+# raise --max-num-batched-tokens past 2112 (8192 does not fit; see docs/ENGINEERING_NOTES.md).
 set -euo pipefail
 
 MODEL_DIR="${VLLM_EXL3_MODEL_DIR:-/models/dsv41-1.62bpw-v3}"
@@ -19,12 +18,13 @@ MTP_K="${MTP_K:-5}"
 CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
-# PREFIX_CACHING=1 reuses the KV of a repeated prompt prefix (multi-turn chat, agents).
-# Off is the measured single-stream path; see README "Prefix caching (opt-in)".
-PCF=--no-enable-prefix-caching
-[ "${PREFIX_CACHING:-0}" = "1" ] && PCF=--enable-prefix-caching
+# Prefix caching (default on) reuses the KV of a repeated prompt prefix (multi-turn chat,
+# agents, follow-up questions on one long document); PREFIX_CACHING=0 turns it off.
+# See README "Prefix caching".
+PCF=--enable-prefix-caching
+[ "${PREFIX_CACHING:-1}" = "0" ] && PCF=--no-enable-prefix-caching
 
-echo "dsv41 serve: model=$MODEL_DIR maxlen=$MAXLEN kv=$KVB mnbt=$MNBT lpt=$LPT mtp_k=$MTP_K graphs=$CG_MODE prefix_caching=${PREFIX_CACHING:-0}"
+echo "dsv41 serve: model=$MODEL_DIR maxlen=$MAXLEN kv=$KVB mnbt=$MNBT lpt=$LPT mtp_k=$MTP_K graphs=$CG_MODE prefix_caching=${PREFIX_CACHING:-1}"
 
 exec vllm serve "$MODEL_DIR" \
     --served-model-name dsv41 \

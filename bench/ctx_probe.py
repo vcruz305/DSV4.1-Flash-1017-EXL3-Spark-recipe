@@ -5,13 +5,15 @@ usage: ctx_probe.py <base_url> <prompt_tokens> <out_jsonl> [needle_depth=0.5] [d
 
 Builds varied log-like filler (unique ids/numbers on every line, so it does not route like a
 repeated sentence), hides a passphrase at the given depth, ends with a plain-text question,
-and sends one greedy streamed /v1/completions request with ignore_eos. Prefix caching is off on
-the serve, so every request is a full prefill. Prints and appends one JSON line:
+and sends one greedy streamed /v1/completions request with ignore_eos. The first line carries a
+per-run nonce, so with prefix caching on (the default) a repeated run still measures a full
+prefill, not a cache hit. Prints and appends one JSON line:
 prompt_tokens, ttft_s, prefill_tok_s, decode_tok_s (tokens after the first / time after the
 first), found (passphrase in the first 64 generated tokens), and the head of the answer.
 Plain-text prompts only (no chat template).
 """
 import json
+import os
 import random
 import sys
 import time
@@ -58,6 +60,8 @@ per_line = ntok(sample) / 200.0
 n = max(10, int((target - ntok(needle + question)) / per_line))
 lines = [line(i) for i in range(n)]
 lines.insert(int(n * depth), needle)
+nonce = f"log export {os.urandom(8).hex()}\n"  # differs every run: no cached prefix to reuse
+lines.insert(0, nonce)
 text = "".join(lines) + question
 count = ntok(text)
 while count > target and len(lines) > 20:

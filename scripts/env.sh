@@ -53,7 +53,7 @@ MTP_K="${MTP_K:-5}"
 CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
-PREFIX_CACHING="${PREFIX_CACHING:-0}"   # 1 = reuse KV of repeated prefixes (opt-in; off is the measured path)
+PREFIX_CACHING="${PREFIX_CACHING:-1}"   # 1 = reuse KV of repeated prefixes (default); 0 = every request is a full prefill
 DSML_STOP="${DSML_STOP:-1}"             # 1 = end tool-call replies at the first closing tag after a DSML invoke
 ATS_LAYERS="${ATS_LAYERS:-38,39}"
 ATS_MTP="${ATS_MTP:-1}"
