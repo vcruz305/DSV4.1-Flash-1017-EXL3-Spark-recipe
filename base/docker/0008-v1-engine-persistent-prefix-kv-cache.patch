@@ -1,0 +1,1787 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:00:00 +0000
+Subject: [PATCH] V1 engine: the prefix KV cache persists across restarts
+
+With DSV41_KV_PERSIST=1 the engine core can save its prefix cache before a
+stop and restores it at the next start, so a prompt cached before a restart
+is a prefix hit after it.
+
+A prefix hit is a scheduler decision over the BlockPool's hash table, and
+every hit block lives at the same block id in each rank's single KV backing
+allocation (all cache groups are views into it). The snapshot is therefore
+each rank's whole backing buffer plus the scheduler's table (per-block hash
+keys and token counts, the hash map in insertion order, the free queue in
+eviction order); restoring both at identical block ids reproduces the
+in-process cache, and request-private state (compressor rings, the CED
+decoder and draft sliding windows) is rebuilt by the usual replay after a
+hit, as in-process.
+
+Save: EngineCore.save_kv_snapshot(abort), reachable as POST
+/v1/dsv41/kv_snapshot[?abort=true] (under /v1, so --api-key guards it;
+registered only with DSV41_KV_PERSIST=1). It refuses while requests are
+running unless abort, which pauses the scheduler (aborting them, the cache
+kept), saves once no step is in flight, and resumes. Every block must be
+free, so each hashed block's contents are final. The old table is deleted
+first; every rank writes its buffer through weight_snapshot's staged
+O_DIRECT pipeline with a CRC32 per 64 MiB chunk into a temporary directory
+renamed into place, tagged with a fresh save epoch; the table, with the same
+epoch, is written last and only if every rank succeeded. An empty cache
+saves nothing and deletes the old snapshot.
+
+Restore: at the end of EngineCore.__init__, after warmup (which writes real
+block ids) and once the scheduler exists. The table is checked first (key,
+COMPLETE marker, a permutation free queue, block ids in range, hash map and
+block keys in agreement); then every rank checks its own key and the epoch
+and reads its buffer, and the table is installed only if every rank
+succeeded. Otherwise the cache starts empty (bytes some ranks overwrote are
+unreachable). A snapshot that fails an integrity check (marker, size,
+CRC32, table consistency) is deleted, and with it the table of an
+incomplete set. Logs: "KV snapshot saved/restored N GiB per rank x R ranks,
+M cached blocks (E hash entries) in X s".
+
+The key covers the checkpoint (as weight_snapshot keys it), the vLLM, B12X
+and TileLang sources, Torch, CUDA, the Python version, a probe of the block
+hash function (sha256 hashes pickle their input), vLLM's config hash, the
+resolved HF config, the cache configuration, the scheduler's KV cache
+configuration (groups, specs, layers, tensor placement, number of blocks,
+layout), the block, scheduler-block and hash-block sizes, the hash algorithm,
+the NONE_HASH seed and value (digests only), the parallel layout, the engine
+environment (without the names vLLM sets afresh in every process) and
+DSV41_KV_PERSIST_TAG. Each rank adds its own checkpoint copy, sources, device
+and KV cache configuration. Unsupported configurations keep
+the feature off with a logged reason: data parallel, a KV connector, KV
+cache events, boundary checkpoints, HiSparse host groups, a random per-process
+NONE_HASH seed.
+
+weight_snapshot's key leaves out the DSV41_KV_PERSIST* switches, so turning
+this on does not invalidate weight snapshots, and both keys leave out
+VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME (envs.py sets a fresh uuid4 in every
+process tree) and VLLM_DIST_IDENT (the CPU worker's rendezvous port or file),
+which otherwise change the key at every boot.
+
+Snapshots live under DSV41_KV_PERSIST_DIR (default
+/cache/dsv41/kv-snapshots), owner-only, DSV41_KV_PERSIST_KEEP per rank
+(default 1); DSV41_KV_PERSIST_VERIFY=0 skips the CRC32 check on restore.
+
+Tests: tests/v1/core/test_kv_snapshot.py (CPU).
+
+License: Apache-2.0 (dsv41-1017 recipe, DeepSeek-V4.1-Flash-1017-4x-DGX-Spark).
+---
+ tests/v1/core/test_kv_snapshot.py             |  433 +++++++
+ vllm/entrypoints/serve/__init__.py            |    6 +
+ .../entrypoints/serve/kv_snapshot/__init__.py |    0
+ .../serve/kv_snapshot/api_router.py           |   44 +
+ .../model_loader/weight_snapshot.py           |    8 +
+ vllm/v1/core/kv_snapshot.py                   | 1097 +++++++++++++++++
+ vllm/v1/engine/async_llm.py                   |    4 +
+ vllm/v1/engine/core.py                        |   19 +
+ 8 files changed, 1611 insertions(+)
+ create mode 100644 tests/v1/core/test_kv_snapshot.py
+ create mode 100644 vllm/entrypoints/serve/kv_snapshot/__init__.py
+ create mode 100644 vllm/entrypoints/serve/kv_snapshot/api_router.py
+ create mode 100644 vllm/v1/core/kv_snapshot.py
+
+diff --git a/tests/v1/core/test_kv_snapshot.py b/tests/v1/core/test_kv_snapshot.py
+new file mode 100644
+index 000000000..7d48642be
+--- /dev/null
++++ b/tests/v1/core/test_kv_snapshot.py
+@@ -0,0 +1,433 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU tests of the persistent prefix KV cache: the BlockPool table round trip,
++the rank buffer store (CRC32, epochs, corruption), and the engine core's
++all-ranks-or-none save and restore."""
++
++import json
++import os
++import stat
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.model_loader import weight_snapshot as ws
++from vllm.v1.core import kv_snapshot as kvs
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
++
++NUM_BLOCKS = 64
++
++
++def _hash(i: int) -> bytes:
++    return i.to_bytes(4, "big") * 8
++
++
++def _key(i: int, group: int = 0) -> bytes:
++    return make_block_hash_with_group_id(_hash(i), group)
++
++
++def _populated_pool() -> BlockPool:
++    """A quiesced pool with full blocks in two groups, a partial entry, extra
++    keys on a block, one key on two blocks, and a reordered free queue."""
++    pool = BlockPool(NUM_BLOCKS, enable_caching=True, hash_block_size=16)
++    first = pool.get_new_blocks(10)
++    second = pool.get_new_blocks(6)
++    for i, block in enumerate(first):
++        pool._insert_block_hash(_key(i), block, num_tokens=(i + 1) * 64)
++    for i, block in enumerate(second[:4]):
++        pool._insert_block_hash(_key(100 + i, group=1), block, num_tokens=None)
++    # Partial entries on a block that already has a primary key.
++    pool._insert_block_hash(_key(7, group=2), first[3], num_tokens=48)
++    pool._insert_block_hash(_key(8, group=2), first[3], num_tokens=32)
++    # A duplicate: the same key on a second block.
++    pool._insert_block_hash(_key(2), second[4], num_tokens=192)
++    # Freed in an order that is not the block order (LRU tail first).
++    pool.free_blocks(reversed(second))
++    pool.free_blocks(reversed(first))
++    return pool
++
++
++def test_table_round_trip_reproduces_lookups_and_eviction():
++    pool = _populated_pool()
++    table = json.loads(json.dumps(kvs.dump_table(pool)))
++    fresh = BlockPool(NUM_BLOCKS, enable_caching=True, hash_block_size=16)
++    plan = kvs.check_table(fresh, table)
++    kvs.install_table(fresh, plan)
++
++    assert kvs.dump_table(fresh) == kvs.dump_table(pool)
++    assert plan.num_hashed_blocks == 15
++    assert plan.num_entries == 17
++    for i in list(range(10)) + [100, 101, 102, 103]:
++        group = 1 if i >= 100 else 0
++        want = pool.get_cached_block(_hash(i), [group])
++        got = fresh.get_cached_block(_hash(i), [group])
++        assert [b.block_id for b in got] == [b.block_id for b in want]
++    assert fresh.get_cached_block(_hash(7), [2])[0].block_id == pool.blocks[4].block_id
++    assert fresh.blocks[4].block_hash_num_tokens == 256
++    assert fresh.cached_block_hashes_by_block == pool.cached_block_hashes_by_block
++    # The same blocks are evicted, in the same order, by the next allocations.
++    want_ids = [b.block_id for b in pool.get_new_blocks(NUM_BLOCKS - 1)]
++    got_ids = [b.block_id for b in fresh.get_new_blocks(NUM_BLOCKS - 1)]
++    assert got_ids == want_ids
++    assert len(fresh.cached_block_hash_to_block) == 0
++
++
++def test_dump_refuses_held_blocks():
++    pool = _populated_pool()
++    pool.get_new_blocks(1)
++    with pytest.raises(RuntimeError, match="still held"):
++        kvs.dump_table(pool)
++
++
++def _tampered(table: dict, mutate) -> dict:
++    table = json.loads(json.dumps(table))
++    mutate(table)
++    return table
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        lambda t: t["free_order"].pop(),
++        lambda t: t["free_order"].__setitem__(0, 0),
++        lambda t: t["blocks"][0].__setitem__(0, NUM_BLOCKS),
++        lambda t: t["blocks"].append(list(t["blocks"][0])),
++        lambda t: t["entries"].pop(),
++        lambda t: t["entries"][0][1].append(t["blocks"][-1][0]),
++        lambda t: t["blocks"][0].__setitem__(1, "zz"),
++        lambda t: t["blocks"][0].__setitem__(2, -1),
++        lambda t: t.pop("entries"),
++    ],
++)
++def test_inconsistent_table_is_corrupt(mutate):
++    table = kvs.dump_table(_populated_pool())
++    fresh = BlockPool(NUM_BLOCKS, enable_caching=True, hash_block_size=16)
++    with pytest.raises(kvs.SnapshotCorrupt):
++        kvs.check_table(fresh, _tampered(table, mutate))
++    assert len(fresh.cached_block_hash_to_block) == 0
++
++
++def test_table_that_does_not_fit_is_unusable_not_corrupt():
++    table = kvs.dump_table(_populated_pool())
++    smaller = BlockPool(NUM_BLOCKS - 1, enable_caching=True, hash_block_size=16)
++    with pytest.raises(kvs.SnapshotUnusable) as info:
++        kvs.check_table(smaller, table)
++    assert not isinstance(info.value, kvs.SnapshotCorrupt)
++    used = _populated_pool()
++    with pytest.raises(kvs.SnapshotUnusable, match="not empty"):
++        kvs.check_table(used, table)
++
++
++# ── rank buffers ────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture
++def small_chunks(monkeypatch):
++    # Several chunks and a ragged tail without allocating 64 MiB slots.
++    monkeypatch.setattr(ws, "_CHUNK", 1 << 16)
++    monkeypatch.setattr(kvs, "_CHUNK", 1 << 16)
++    monkeypatch.setattr(kvs, "_SPACE_MARGIN", 0)
++
++
++def _buffer(seed: int, nbytes: int = 5 * (1 << 16) + 1234) -> torch.Tensor:
++    generator = torch.Generator().manual_seed(seed)
++    return torch.randint(-128, 127, (nbytes,), dtype=torch.int8, generator=generator)
++
++
++def _store(root, key: str = "k" * 64, prefix: str = "rank00of01") -> kvs.SnapshotDir:
++    return kvs.SnapshotDir(root, prefix, key, {"key": key})
++
++
++def test_storage_round_trip_and_modes(tmp_path, small_chunks):
++    source = _buffer(1)
++    store = _store(tmp_path)
++    nbytes = kvs.write_storage(store, source.untyped_storage(), "e1", direct=False)
++    assert nbytes == ws._align(source.numel())
++    for name in (kvs.DATA_FILE, kvs.MANIFEST_FILE, kvs.COMPLETE_FILE):
++        assert stat.S_IMODE(os.stat(store.path / name).st_mode) == 0o600
++    target = torch.zeros_like(source)
++    kvs.restore_storage(store, target.untyped_storage(), "e1", direct=False)
++    assert torch.equal(target, source)
++
++
++def test_epoch_mismatch_is_refused_before_reading(tmp_path, small_chunks):
++    source = _buffer(2)
++    store = _store(tmp_path)
++    kvs.write_storage(store, source.untyped_storage(), "old", direct=False)
++    target = torch.zeros_like(source)
++    with pytest.raises(kvs.SnapshotUnusable, match="from save old") as info:
++        kvs.restore_storage(store, target.untyped_storage(), "new", direct=False)
++    assert not isinstance(info.value, kvs.SnapshotCorrupt)
++    assert not target.any()
++
++
++@pytest.mark.parametrize("damage", ["flip", "truncate", "manifest"])
++def test_damaged_snapshot_is_corrupt(tmp_path, small_chunks, damage):
++    source = _buffer(3)
++    store = _store(tmp_path)
++    kvs.write_storage(store, source.untyped_storage(), "e", direct=False)
++    data = store.path / kvs.DATA_FILE
++    if damage == "flip":
++        raw = bytearray(data.read_bytes())
++        raw[3 * (1 << 16) + 7] ^= 0x40
++        data.write_bytes(bytes(raw))
++    elif damage == "truncate":
++        with open(data, "r+b") as handle:
++            handle.truncate(4096)
++    else:
++        manifest = json.loads((store.path / kvs.MANIFEST_FILE).read_text())
++        manifest["epoch"] = "other"
++        (store.path / kvs.MANIFEST_FILE).write_text(json.dumps(manifest))
++    with pytest.raises(kvs.SnapshotCorrupt):
++        kvs.restore_storage(
++            store, torch.zeros_like(source).untyped_storage(), "e", direct=False
++        )
++
++
++def test_missing_snapshot_names_the_differing_factors(tmp_path, small_chunks):
++    source = _buffer(4)
++    old = kvs.SnapshotDir(tmp_path, "rank00of01", "a" * 64, {"tag": "x", "n": 1})
++    kvs.write_storage(old, source.untyped_storage(), "e", direct=False)
++    new = kvs.SnapshotDir(tmp_path, "rank00of01", "b" * 64, {"tag": "y", "n": 1})
++    with pytest.raises(kvs.SnapshotUnusable, match="differs in tag"):
++        new.manifest()
++    # Saving under the new key keeps no snapshot with another key (KEEP=1).
++    kvs.write_storage(new, source.untyped_storage(), "e2", direct=False, keep=1)
++    assert sorted(p.name for p in tmp_path.iterdir()) == [new.path.name]
++
++
++# ── the engine core: all ranks or none ──────────────────────────────────────────
++
++
++class _Scheduler:
++    def __init__(self, pool: BlockPool):
++        self.kv_cache_manager = SimpleNamespace(block_pool=pool)
++        self.busy = False
++
++    def has_requests(self) -> bool:
++        return self.busy
++
++
++class _Engine:
++    def __init__(self, pool: BlockPool, workers: list):
++        self.vllm_config = None
++        self.scheduler = _Scheduler(pool)
++        self.batch_queue = None
++        self.model_executor = None
++        self.workers = workers
++
++    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
++        return [method(worker, *args, **(kwargs or {})) for worker in self.workers]
++
++
++def _worker(rank: int, buffer: torch.Tensor):
++    config = SimpleNamespace(
++        kv_cache_tensors=[SimpleNamespace(size=buffer.numel(), host_resident=False)]
++    )
++    half = buffer.numel() // 2
++    runner = SimpleNamespace(
++        kv_cache_config=config, kv_caches=[buffer[:half], buffer[half:]]
++    )
++    return SimpleNamespace(model_runner=runner, vllm_config=SimpleNamespace(rank=rank))
++
++
++@pytest.fixture
++def engine_env(tmp_path, monkeypatch, small_chunks):
++    monkeypatch.setenv(kvs.ENV_DIR, str(tmp_path))
++    monkeypatch.setattr(kvs.KVSnapshot, "_unsupported", lambda self, config: None)
++    monkeypatch.setattr(kvs, "engine_key_factors", lambda *args: {"engine": 1})
++    monkeypatch.setattr(
++        kvs,
++        "rank_key_factors",
++        lambda vllm_config, config, nbytes, engine_key: {
++            "ranks": {"world": [vllm_config.rank, 2]},
++            "engine_key": engine_key,
++            "bytes": nbytes,
++        },
++    )
++    monkeypatch.setattr(kvs, "_open_flags", lambda direct: 0)
++    return tmp_path
++
++
++def _boot(buffers: list[torch.Tensor]) -> tuple[_Engine, kvs.KVSnapshot]:
++    pool = BlockPool(NUM_BLOCKS, enable_caching=True, hash_block_size=16)
++    engine = _Engine(pool, [_worker(r, b) for r, b in enumerate(buffers)])
++    return engine, kvs.KVSnapshot(engine, None, 256, 16)
++
++
++def _saved(root) -> tuple[_Engine, list[torch.Tensor]]:
++    buffers = [_buffer(10), _buffer(11)]
++    engine, snapshot = _boot(buffers)
++    engine.scheduler = _Scheduler(_populated_pool())
++    result = snapshot.save(abort=False)
++    assert result["saved"] and result["ranks"] == 2 and result["cached_blocks"] == 15
++    names = sorted(p.name.split("-")[0] for p in root.iterdir())
++    assert names == ["rank00of02", "rank01of02", "scheduler"]
++    return engine, buffers
++
++
++def test_engine_save_then_restore(engine_env):
++    engine, buffers = _saved(engine_env)
++    fresh = [torch.zeros_like(b) for b in buffers]
++    booted, snapshot = _boot(fresh)
++    snapshot.restore()
++    assert all(torch.equal(a, b) for a, b in zip(fresh, buffers))
++    pool = booted.scheduler.kv_cache_manager.block_pool
++    assert kvs.dump_table(pool) == kvs.dump_table(
++        engine.scheduler.kv_cache_manager.block_pool
++    )
++
++
++def test_empty_cache_saves_nothing_and_drops_the_old_snapshot(engine_env):
++    _, buffers = _saved(engine_env)
++    engine, snapshot = _boot(buffers)
++    result = snapshot.save(abort=False)
++    assert result["saved"] and result["cached_blocks"] == 0
++    assert not any(engine_env.iterdir())
++
++
++def test_abort_pauses_saves_after_the_pause_and_resumes(engine_env):
++    from concurrent.futures import Future
++
++    from vllm.v1.core.sched.interface import PauseState
++
++    buffers = [_buffer(10), _buffer(11)]
++    engine, snapshot = _boot(buffers)
++    engine.scheduler = _Scheduler(_populated_pool())
++    engine.scheduler.busy = True
++    engine.scheduler.pause_state = PauseState.UNPAUSED
++    calls = []
++    pause_done: Future = Future()
++
++    def pause_scheduler(mode, clear_cache):
++        calls.append(("pause", mode, clear_cache))
++        return pause_done
++
++    engine.pause_scheduler = pause_scheduler
++    engine.resume_scheduler = lambda: calls.append(("resume",))
++    result = snapshot.save(abort=True)
++    assert calls == [("pause", "abort", False)] and not result.done()
++    assert not any(engine_env.iterdir())
++    engine.scheduler.busy = False
++    pause_done.set_result(None)
++    assert result.result()["saved"] and calls[-1] == ("resume",)
++
++
++def test_engine_refuses_while_busy_without_abort(engine_env):
++    engine, snapshot = _boot([_buffer(1)])
++    engine.scheduler.busy = True
++    with pytest.raises(RuntimeError, match="requests are running"):
++        snapshot.save(abort=False)
++    assert not any(engine_env.iterdir())
++
++
++def test_engine_writes_no_table_when_a_rank_fails(engine_env):
++    engine, snapshot = _boot([_buffer(1), _buffer(2)])
++    engine.scheduler = _Scheduler(_populated_pool())
++    engine.workers[1].model_runner.kv_caches = [torch.zeros(8, dtype=torch.int8)]
++    result = snapshot.save(abort=False)
++    assert not result["saved"] and "rank 1 not written" in result["reason"]
++    assert not any(p.name.startswith("scheduler-") for p in engine_env.iterdir())
++
++
++def test_corrupt_rank_restores_nothing_and_deletes(engine_env):
++    _, buffers = _saved(engine_env)
++    rank1 = next(engine_env.glob("rank01of02-*"))
++    raw = bytearray((rank1 / kvs.DATA_FILE).read_bytes())
++    raw[100] ^= 1
++    (rank1 / kvs.DATA_FILE).write_bytes(bytes(raw))
++    booted, snapshot = _boot([torch.zeros_like(b) for b in buffers])
++    snapshot.restore()
++    pool = booted.scheduler.kv_cache_manager.block_pool
++    assert len(pool.cached_block_hash_to_block) == 0
++    assert pool.get_num_free_blocks() == NUM_BLOCKS - 1
++    # The corrupt rank snapshot and the now incomplete set's table are gone.
++    assert sorted(p.name.split("-")[0] for p in engine_env.iterdir()) == ["rank00of02"]
++
++
++def test_stale_rank_epoch_restores_nothing(engine_env):
++    _, buffers = _saved(engine_env)
++    rank1 = next(engine_env.glob("rank01of02-*"))
++    stale = engine_env / "stale"
++    os.rename(rank1, stale)
++    # A second save; then rank 1 is put back to the first save's snapshot.
++    engine, snapshot = _boot(buffers)
++    engine.scheduler = _Scheduler(_populated_pool())
++    assert snapshot.save(abort=False)["saved"]
++    rank1 = next(engine_env.glob("rank01of02-*"))
++    os.rename(rank1, engine_env / "second")
++    os.rename(stale, rank1)
++    booted, snapshot = _boot([torch.zeros_like(b) for b in buffers])
++    snapshot.restore()
++    assert (
++        len(booted.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block)
++        == 0
++    )
++    # Not corrupt: nothing is deleted.
++    assert any(p.name.startswith("scheduler-") for p in engine_env.iterdir())
++
++
++def test_corrupt_table_is_deleted(engine_env):
++    _saved(engine_env)
++    table_dir = next(engine_env.glob("scheduler-*"))
++    (table_dir / kvs.COMPLETE_FILE).write_text("0" * 64)
++    booted, snapshot = _boot(
++        [torch.zeros_like(_buffer(10)), torch.zeros_like(_buffer(11))]
++    )
++    snapshot.restore()
++    assert (
++        len(booted.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block)
++        == 0
++    )
++    assert not table_dir.exists()
++
++
++def test_rank_failures_lists_each_failed_rank():
++    results = [{"ok": True}, {"ok": False, "reason": "no snapshot"}, None]
++    assert kvs.rank_failures(results, "not restored") == [
++        "rank 1 not restored: no snapshot",
++        "rank 2 not restored: None",
++    ]
++
++
++def test_key_helpers_are_deterministic_and_address_free():
++    from vllm.utils.hashing import sha256
++    from vllm.v1.core.kv_cache_utils import init_none_hash
++    from vllm.v1.kv_cache_interface import KVCacheGroupRole, KVCacheTensor
++
++    init_none_hash(sha256)
++    probe = kvs._hash_probe("sha256")
++    assert probe == kvs._hash_probe("sha256") and len(probe) == 64
++    value = {
++        "tensor": KVCacheTensor(
++            size=4096, layers=["a", "b"], layer_stride=1, block_stride=2
++        ),
++        "role": KVCacheGroupRole.DEFAULT,
++        "dtype": torch.bfloat16,
++        "object": object(),
++    }
++    plain = kvs._plain(value)
++    assert plain["role"] == "default" and plain["dtype"] == "torch.bfloat16"
++    assert plain["object"] == "object"
++    assert plain["tensor"]["fields"]["layers"] == ["a", "b"]
++    assert kvs._digest(value) == kvs._digest(dict(value, object=object()))
++
++
++def test_per_process_environment_does_not_change_the_key(monkeypatch):
++    monkeypatch.setenv("DSV41_SOMETHING", "kept")
++    keys = []
++    for boot in ("a" * 32, "b" * 32):
++        monkeypatch.setenv(
++            "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
++            f"VLLM_OBJECT_STORAGE_SHM_BUFFER_{boot}",
++        )
++        monkeypatch.setenv("VLLM_DIST_IDENT", boot)
++        monkeypatch.setenv("DSV41_KV_PERSIST", "1" if boot[0] == "a" else "0")
++        env = kvs._environment_factors()
++        assert env == ws._environment()
++        assert "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME" not in env
++        assert env["DSV41_SOMETHING"] == "kept"
++        keys.append(kvs._key_of({"environment": env}))
++    assert keys[0] == keys[1]
+diff --git a/vllm/entrypoints/serve/__init__.py b/vllm/entrypoints/serve/__init__.py
+index 2b346223e..51b0e7edd 100644
+--- a/vllm/entrypoints/serve/__init__.py
++++ b/vllm/entrypoints/serve/__init__.py
+@@ -39,6 +39,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
+ 
+     attach_tokenize_router(app)
+ 
++    from vllm.entrypoints.serve.kv_snapshot.api_router import (
++        attach_router as attach_kv_snapshot_router,
++    )
++
++    attach_kv_snapshot_router(app)
++
+ 
+ def register_vllm_dev_api_routers(app: FastAPI):
+     logger.warning(
+diff --git a/vllm/entrypoints/serve/kv_snapshot/__init__.py b/vllm/entrypoints/serve/kv_snapshot/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/entrypoints/serve/kv_snapshot/api_router.py b/vllm/entrypoints/serve/kv_snapshot/api_router.py
+new file mode 100644
+index 000000000..6d6dde8bd
+--- /dev/null
++++ b/vllm/entrypoints/serve/kv_snapshot/api_router.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""POST /v1/dsv41/kv_snapshot: save the prefix cache for the next start
++(DSV41_KV_PERSIST=1, vllm/v1/core/kv_snapshot.py). Under /v1, so --api-key
++guards it."""
++
++from fastapi import APIRouter, FastAPI, Query, Request
++from fastapi.responses import JSONResponse
++
++from vllm.logger import init_logger
++from vllm.v1.core.kv_snapshot import enabled
++
++logger = init_logger(__name__)
++
++router = APIRouter()
++
++
++@router.post("/v1/dsv41/kv_snapshot")
++async def save_kv_snapshot(raw_request: Request, abort: bool = Query(default=False)):
++    """Write every rank's KV buffer and the scheduler's prefix-cache table.
++
++    The engine must be idle, or ``abort=true`` aborts every running and
++    waiting request first (the scheduler pauses, saves, and resumes). Returns
++    200 with the save summary, or 409 with ``reason`` when nothing was saved.
++    """
++    save = getattr(raw_request.app.state.engine_client, "save_kv_snapshot", None)
++    if save is None:
++        return JSONResponse(
++            content={"saved": False, "reason": "engine client cannot save"},
++            status_code=501,
++        )
++    try:
++        result = await save(abort)
++    except Exception as exc:  # noqa: BLE001 - reported to the caller
++        logger.warning("KV snapshot not saved: %s", exc)
++        return JSONResponse(
++            content={"saved": False, "reason": str(exc)}, status_code=409
++        )
++    return JSONResponse(content=result, status_code=200 if result.get("saved") else 409)
++
++
++def attach_router(app: FastAPI):
++    if enabled():
++        app.include_router(router)
+diff --git a/vllm/model_executor/model_loader/weight_snapshot.py b/vllm/model_executor/model_loader/weight_snapshot.py
+index c857cfef0..02223c35b 100644
+--- a/vllm/model_executor/model_loader/weight_snapshot.py
++++ b/vllm/model_executor/model_loader/weight_snapshot.py
+@@ -89,6 +89,11 @@ _ENV_PREFIXES = ("VLLM_", "SPARK3_", "B12X_", "DSV41_", "SAFETENSORS_")
+ _ENV_EXCLUDED = frozenset(
+     {"KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PORT", "RPC", "INSTANCE"}
+ )
++# Names vLLM sets to a fresh value in every process tree: envs.py fills
++# VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME through get_env_or_set_default with a
++# uuid4, and the CPU worker sets VLLM_DIST_IDENT from its rendezvous port or
++# file. They shape nothing that is snapshotted.
++_ENV_PER_PROCESS = frozenset({"VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", "VLLM_DIST_IDENT"})
+ _MODULE_KEYS = ("_parameters", "_buffers", "_modules")
+ _MISSING = object()
+ 
+@@ -897,12 +902,15 @@ def _source_fingerprint(package: str) -> str | None:
+ 
+ 
+ def _environment() -> dict[str, str]:
++    # The KV snapshot switches (DSV41_KV_PERSIST*) do not shape the weights.
+     return {
+         name: value
+         for name, value in sorted(os.environ.items())
+         if name.startswith(_ENV_PREFIXES)
+         and not _ENV_EXCLUDED.intersection(name.split("_"))
++        and name not in _ENV_PER_PROCESS
+         and not (name.startswith(ENV_ENABLE) and name != ENV_TAG)
++        and not name.startswith("DSV41_KV_PERSIST")
+     }
+ 
+ 
+diff --git a/vllm/v1/core/kv_snapshot.py b/vllm/v1/core/kv_snapshot.py
+new file mode 100644
+index 000000000..8ded60cc2
+--- /dev/null
++++ b/vllm/v1/core/kv_snapshot.py
+@@ -0,0 +1,1097 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Persistent prefix KV cache: a snapshot of every rank's KV backing buffer and
++of the scheduler's prefix-cache table, saved on request before a stop and
++restored when the engine starts.
++
++A prefix hit is a scheduler decision over the BlockPool's hash table; each hit
++block's bytes live at the same block id in every rank's single KV backing
++allocation (all cache groups are views into it). Restoring the backing buffer
++bytes and the table at identical block ids therefore reproduces the in-process
++prefix cache exactly: request-private state (compressor rings, sliding windows
++that are not prefix-cached) is rebuilt by the usual replay after a hit, as it
++is in-process.
++
++Save (``EngineCore.save_kv_snapshot``, ``POST /v1/dsv41/kv_snapshot``): the
++engine must be idle; with ``abort`` it pauses the scheduler (aborting running
++and waiting requests), waits until no step is in flight, saves, and resumes.
++Every block must then be free (reference count 0), so each hashed block's
++contents are final. The scheduler drops its old table first, every rank writes
++its whole backing buffer (O_DIRECT, CRC32 per 64 MiB chunk, temporary directory
++renamed into place) tagged with a fresh save epoch, and the table, with the
++same epoch, is written last, only if every rank succeeded.
++
++Restore (end of ``EngineCore.__init__``, after warmup, which writes real block
++ids, and after the scheduler exists): the table is checked (key, format,
++COMPLETE marker, internal consistency) before any rank reads; then every rank
++checks its own key and epoch and reads its buffer, and the table is installed
++only if every rank succeeded. Otherwise the cache stays empty; bytes some ranks
++already overwrote are unreachable. A snapshot that fails its integrity checks
++(marker, size, CRC32, table consistency) is deleted.
++
++The key covers what makes the blocks valid: the checkpoint (shard sizes, mtimes,
++safetensors headers, JSON files), the vLLM, B12X and TileLang sources, Torch,
++CUDA, the device, the Python version and a probe of the block hash function
++(sha256 block hashes pickle their input), vLLM's config hash, the resolved HF
++config, the cache configuration, the KV cache configuration (groups, specs,
++layer names, tensor placement, number of blocks, layout), the block,
++scheduler-block and hash-block sizes, the hash algorithm and NONE_HASH seed,
++the parallel layout, the engine environment (``VLLM_*``, ``SPARK3_*``,
++``B12X_*``, ``DSV41_*``, ``SAFETENSORS_*`` without secrets, ports, names vLLM
++sets afresh in every process such as ``VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME``,
++and the ``DSV41_KV_PERSIST*`` switches) and ``DSV41_KV_PERSIST_TAG``. Each rank
++adds its own checkpoint copy, sources, device and KV cache configuration.
++
++Environment:
++    DSV41_KV_PERSIST          1 enables save and restore (default 0)
++    DSV41_KV_PERSIST_DIR      root directory (default /cache/dsv41/kv-snapshots)
++    DSV41_KV_PERSIST_TAG      free-form string in the key; change it to
++                              invalidate every snapshot
++    DSV41_KV_PERSIST_KEEP     snapshots kept per rank, newest first (default 1)
++    DSV41_KV_PERSIST_VERIFY   0 skips the CRC32 check of restored chunks
++                              (default 1)
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import enum
++import hashlib
++import json
++import os
++import shutil
++import sys
++import time
++import uuid
++import zlib
++from collections.abc import Callable
++from concurrent.futures import Future
++from pathlib import Path
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.model_loader.weight_snapshot import (
++    _CHUNK,
++    _O_DIRECT,
++    SnapshotUnusable,
++    _align,
++    _bytes,
++    _checkpoint_fingerprint,
++    _chunks,
++    _device_to_host,
++    _differences,
++    _env_flag,
++    _environment,
++    _fsync_dir,
++    _gib,
++    _host_to_device,
++    _Layout,
++    _pwrite,
++    _ranks,
++    _source_fingerprint,
++)
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_utils import KVCacheBlock
++
++logger = init_logger(__name__)
++
++ENV_ENABLE = "DSV41_KV_PERSIST"
++ENV_DIR = "DSV41_KV_PERSIST_DIR"
++ENV_TAG = "DSV41_KV_PERSIST_TAG"
++ENV_KEEP = "DSV41_KV_PERSIST_KEEP"
++ENV_VERIFY = "DSV41_KV_PERSIST_VERIFY"
++DEFAULT_DIR = "/cache/dsv41/kv-snapshots"
++
++FORMAT = "dsv41-kv-snapshot/1"
++DATA_FILE = "kv.bin"
++MANIFEST_FILE = "manifest.json"
++COMPLETE_FILE = "COMPLETE"
++SCHEDULER_PREFIX = "scheduler"
++
++# Free space left on the cache filesystem after a snapshot is written.
++_SPACE_MARGIN = 4 << 30
++# Snapshots hold prompt contents: owner-only.
++_FILE_MODE = 0o600
++_DIR_MODE = 0o700
++_PLAIN_DEPTH = 6
++
++
++class SnapshotCorrupt(SnapshotUnusable):
++    """The snapshot failed an integrity check; it is deleted."""
++
++
++def enabled() -> bool:
++    return _env_flag(ENV_ENABLE)
++
++
++def _root() -> Path:
++    return Path(os.environ.get(ENV_DIR, DEFAULT_DIR))
++
++
++def _keep() -> int:
++    return max(int(os.environ.get(ENV_KEEP, "1")), 1)
++
++
++def _sha256(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _key_of(factors: dict[str, Any]) -> str:
++    return _sha256(json.dumps(factors, sort_keys=True).encode())
++
++
++# ── key factors ─────────────────────────────────────────────────────────────────
++
++
++def _plain(value: Any, depth: int = 0) -> Any:
++    """JSON form of a configuration object: dataclasses by field, enums by
++    value, dtypes by name; other objects reduce to their type names so the key
++    never depends on an address in a repr."""
++    if value is None or isinstance(value, (bool, int, float, str)):
++        return value
++    if isinstance(value, enum.Enum):
++        return _plain(value.value, depth)
++    if isinstance(value, torch.dtype):
++        return str(value)
++    if depth >= _PLAIN_DEPTH:
++        return type(value).__qualname__
++    if isinstance(value, (list, tuple)):
++        return [_plain(item, depth + 1) for item in value]
++    if isinstance(value, (set, frozenset)):
++        return sorted(
++            json.dumps(_plain(item, depth + 1), sort_keys=True) for item in value
++        )
++    if isinstance(value, dict):
++        return {str(k): _plain(v, depth + 1) for k, v in sorted(value.items(), key=str)}
++    if dataclasses.is_dataclass(value) and not isinstance(value, type):
++        fields = {
++            field.name: _plain(getattr(value, field.name, None), depth + 1)
++            for field in dataclasses.fields(value)
++        }
++        return {"type": type(value).__qualname__, "fields": fields}
++    return type(value).__qualname__
++
++
++def _digest(value: Any) -> str:
++    return _sha256(json.dumps(_plain(value), sort_keys=True).encode())
++
++
++def _environment_factors() -> dict[str, str]:
++    """The engine environment of weight_snapshot (which leaves out every
++    DSV41_KV_PERSIST* switch); the tag is a factor of its own."""
++    return _environment()
++
++
++def _sources() -> dict[str, Any]:
++    return {
++        "vllm_sources": _source_fingerprint("vllm"),
++        "b12x_sources": _source_fingerprint("b12x"),
++        "tilelang_sources": _source_fingerprint("tilelang"),
++        "torch": torch.__version__,
++        "cuda": torch.version.cuda,
++    }
++
++
++def _kv_cache_summary(kv_cache_config: Any) -> dict[str, Any]:
++    return {
++        "digest": _digest(kv_cache_config),
++        "num_blocks": kv_cache_config.num_blocks,
++        "groups": len(kv_cache_config.kv_cache_groups),
++        "layout": kv_cache_config.kv_cache_layout,
++    }
++
++
++def _hash_probe(algo: str) -> str:
++    """Two chained block hashes of fixed tokens (one with an extra key, as a
++    cache salt adds): they change if the serialization under the hash does
++    (Python or pickle version, CBOR library)."""
++    from vllm.utils.hashing import get_hash_fn_by_name
++    from vllm.v1.core.kv_cache_utils import hash_block_tokens
++
++    hash_fn = get_hash_fn_by_name(algo)
++    first = hash_block_tokens(hash_fn, None, (0, 1, 2, 255, 65535, 1 << 20))
++    second = hash_block_tokens(hash_fn, first, (3, 1 << 17), ("probe",))
++    return bytes(second).hex()
++
++
++def engine_key_factors(
++    vllm_config: Any,
++    kv_cache_config: Any,
++    scheduler_block_size: int,
++    hash_block_size: int,
++) -> dict[str, Any]:
++    """The rank-independent key, formed by the engine core (no CUDA here)."""
++    import vllm
++    from vllm.v1.core import kv_cache_utils
++
++    model_config = vllm_config.model_config
++    cache_config = vllm_config.cache_config
++    parallel = vllm_config.parallel_config
++    spec = vllm_config.speculative_config
++    return {
++        "format": FORMAT,
++        "tag": os.environ.get(ENV_TAG, ""),
++        "checkpoint": _checkpoint_fingerprint(model_config.model),
++        "engine": {
++            "vllm": vllm.__version__,
++            **_sources(),
++            "python": sys.version,
++        },
++        "config": {
++            "vllm_hash": vllm_config.compute_hash(),
++            "model": model_config.model,
++            "revision": getattr(model_config, "revision", None),
++            "tokenizer_revision": getattr(model_config, "tokenizer_revision", None),
++            "dtype": str(model_config.dtype),
++            "quantization": model_config.quantization,
++            "hf_config": hashlib.sha256(
++                json.dumps(
++                    model_config.hf_config.to_dict(),
++                    sort_keys=True,
++                    default=lambda value: type(value).__qualname__,
++                ).encode()
++            ).hexdigest(),
++            "speculative": None
++            if spec is None
++            else [spec.method, spec.num_speculative_tokens],
++        },
++        "cache": {
++            "cache_config": _digest(cache_config),
++            "cache_dtype": str(cache_config.cache_dtype),
++            "block_size": cache_config.block_size,
++            "scheduler_block_size": scheduler_block_size,
++            "hash_block_size": hash_block_size,
++            "hash_algo": cache_config.prefix_caching_hash_algo,
++            "none_hash_seed": _sha256(kv_cache_utils.get_none_hash_seed().encode()),
++            "none_hash": _sha256(bytes(kv_cache_utils.NONE_HASH)),
++            "hash_probe": _hash_probe(cache_config.prefix_caching_hash_algo),
++            "retention_interval": kv_cache_config.prefix_cache_retention_interval,
++            "kv_cache": _kv_cache_summary(kv_cache_config),
++        },
++        "parallel": {
++            "tp": parallel.tensor_parallel_size,
++            "pp": parallel.pipeline_parallel_size,
++            "dp": parallel.data_parallel_size,
++            "dcp": getattr(parallel, "decode_context_parallel_size", 1),
++            "pcp": getattr(parallel, "prefill_context_parallel_size", 1),
++            "nnodes": getattr(parallel, "nnodes", 1),
++        },
++        "environment": _environment_factors(),
++    }
++
++
++def rank_key_factors(
++    vllm_config: Any, kv_cache_config: Any, storage_bytes: int, engine_key: str
++) -> dict[str, Any]:
++    """This rank's key: the engine key plus what this rank reads and runs."""
++    device = (
++        torch.accelerator.current_device_index() if torch.cuda.is_available() else None
++    )
++    return {
++        "format": FORMAT,
++        "engine_key": engine_key,
++        "ranks": _ranks(),
++        "checkpoint": _checkpoint_fingerprint(vllm_config.model_config.model),
++        "engine": {
++            **_sources(),
++            "device": None
++            if device is None
++            else [
++                torch.cuda.get_device_name(device),
++                list(torch.cuda.get_device_capability(device)),
++            ],
++        },
++        "kv_cache": {
++            **_kv_cache_summary(kv_cache_config),
++            "storage_bytes": storage_bytes,
++        },
++        "environment": _environment_factors(),
++    }
++
++
++# ── one snapshot directory ──────────────────────────────────────────────────────
++
++
++def _write_file(path: Path, content: bytes) -> None:
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, _FILE_MODE)
++    try:
++        view = memoryview(content)
++        while view:
++            view = view[os.write(fd, view) :]
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++class SnapshotDir:
++    """``<root>/<prefix>-<key>/`` with a manifest and a COMPLETE marker holding
++    the manifest's SHA-256 (weight_snapshot's SnapshotStore layout)."""
++
++    def __init__(self, root: Path, prefix: str, key: str, factors: dict[str, Any]):
++        self.root = Path(root)
++        self.prefix = prefix
++        self.key = key
++        self.factors = factors
++        self.path = self.root / f"{prefix}-{key[:24]}"
++
++    def manifest(self) -> dict[str, Any]:
++        """The checked manifest; SnapshotUnusable if there is none for this
++        key, SnapshotCorrupt if it fails its marker."""
++        complete = self.path / COMPLETE_FILE
++        if not complete.is_file():
++            raise SnapshotUnusable(
++                f"no snapshot for this key at {self.path}{self._newest_sibling_diff()}"
++            )
++        try:
++            raw = (self.path / MANIFEST_FILE).read_bytes()
++            marker = complete.read_text().strip()
++        except OSError as exc:
++            raise SnapshotCorrupt(f"unreadable manifest: {exc}") from exc
++        if marker != _sha256(raw):
++            raise SnapshotCorrupt("manifest does not match its COMPLETE marker")
++        try:
++            manifest = json.loads(raw)
++        except ValueError as exc:
++            raise SnapshotCorrupt(f"manifest is not JSON: {exc}") from exc
++        if manifest.get("format") != FORMAT or manifest.get("key") != self.key:
++            raise SnapshotUnusable("manifest format or key differs")
++        return manifest
++
++    def begin(self, keep: int) -> Path:
++        """Drop this key's snapshot (it is about to be replaced) and all but
++        the newest ``keep - 1`` others, and return an empty temporary
++        directory."""
++        self.root.mkdir(parents=True, exist_ok=True, mode=_DIR_MODE)
++        self.discard()
++        for stale in self.root.glob(f".tmp-{self.prefix}-*"):
++            shutil.rmtree(stale, ignore_errors=True)
++        others = sorted(self._siblings(), key=_mtime, reverse=True)
++        for old in others[max(keep, 1) - 1 :]:
++            shutil.rmtree(old, ignore_errors=True)
++        tmp = self.root / f".tmp-{self.path.name}-{os.getpid()}"
++        shutil.rmtree(tmp, ignore_errors=True)
++        tmp.mkdir(mode=_DIR_MODE)
++        return tmp
++
++    def commit(self, tmp: Path, manifest: dict[str, Any]) -> None:
++        """Write the manifest and its marker into ``tmp`` and rename it into
++        place."""
++        raw = json.dumps(manifest, sort_keys=True).encode()
++        _write_file(tmp / MANIFEST_FILE, raw)
++        _write_file(tmp / COMPLETE_FILE, _sha256(raw).encode() + b"\n")
++        _fsync_dir(tmp)
++        shutil.rmtree(self.path, ignore_errors=True)
++        os.rename(tmp, self.path)
++        _fsync_dir(self.root)
++
++    def discard(self) -> None:
++        shutil.rmtree(self.path, ignore_errors=True)
++
++    def _siblings(self) -> list[Path]:
++        if not self.root.is_dir():
++            return []
++        return [
++            p
++            for p in self.root.iterdir()
++            if p.name.startswith(f"{self.prefix}-") and p != self.path
++        ]
++
++    def _newest_sibling_diff(self) -> str:
++        """Which key factors differ from the newest snapshot with another key."""
++        for other in sorted(self._siblings(), key=_mtime, reverse=True):
++            try:
++                factors = json.loads((other / MANIFEST_FILE).read_bytes())[
++                    "key_factors"
++                ]
++            except (OSError, ValueError, KeyError):
++                continue
++            changed = _differences(factors, self.factors)
++            listed = ", ".join(changed[:12]) + (" ..." if len(changed) > 12 else "")
++            return f" ({other.name} differs in {listed or 'nothing visible'})"
++        return ""
++
++
++def _mtime(path: Path) -> float:
++    try:
++        return path.stat().st_mtime
++    except OSError:
++        return 0.0
++
++
++# ── a rank's KV backing buffer ──────────────────────────────────────────────────
++
++
++def kv_storage(runner: Any) -> torch.UntypedStorage:
++    """The one storage behind every KV cache view of the model runner, checked
++    against the KV cache configuration's backing allocation."""
++    config = runner.kv_cache_config
++    if any(t.host_resident for t in config.kv_cache_tensors):
++        raise SnapshotUnusable("host-resident KV cache tensors (HiSparse)")
++    sizes = {t.size for t in config.kv_cache_tensors}
++    if len(sizes) != 1:
++        raise SnapshotUnusable(f"KV cache tensors of {len(sizes)} sizes")
++    size = sizes.pop()
++    storages: dict[tuple[str, int], torch.UntypedStorage] = {}
++    for cache in runner.kv_caches:
++        if not isinstance(cache, torch.Tensor):
++            continue
++        storage = cache.untyped_storage()
++        storages.setdefault((str(cache.device), storage.data_ptr()), storage)
++    if len(storages) != 1:
++        raise SnapshotUnusable(
++            f"{len(storages)} KV cache storages, expected one backing allocation"
++        )
++    storage = next(iter(storages.values()))
++    if storage.nbytes() != size:
++        raise SnapshotUnusable(
++            f"the KV storage ({storage.nbytes()} bytes) is not exactly the backing "
++            f"allocation ({size} bytes)"
++        )
++    return storage
++
++
++def _layout(storage: torch.UntypedStorage) -> _Layout:
++    nbytes = storage.nbytes()
++    return _Layout([], [storage], [nbytes], [0], _align(nbytes))
++
++
++def _open_flags(direct: bool) -> int:
++    if not direct:
++        return 0
++    if not _O_DIRECT:
++        raise SnapshotUnusable("O_DIRECT is unavailable on this platform")
++    return _O_DIRECT
++
++
++def write_storage(
++    store: SnapshotDir,
++    storage: torch.UntypedStorage,
++    epoch: str,
++    *,
++    keep: int = 1,
++    direct: bool = True,
++) -> int:
++    """Write the whole storage into ``store`` under ``epoch``; returns the data
++    bytes."""
++    layout = _layout(storage)
++    flags = _open_flags(direct)
++    tmp = store.begin(keep)
++    try:
++        free = shutil.disk_usage(store.root).free
++        if free < layout.data_bytes + _SPACE_MARGIN:
++            raise SnapshotUnusable(
++                f"{_gib(free):.1f} GiB free under {store.root}, need "
++                f"{_gib(layout.data_bytes + _SPACE_MARGIN):.1f} GiB"
++            )
++        fd = os.open(
++            tmp / DATA_FILE,
++            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | flags,
++            _FILE_MODE,
++        )
++        try:
++            if hasattr(os, "posix_fallocate") and layout.data_bytes:
++                os.posix_fallocate(fd, 0, layout.data_bytes)
++            chunks = _chunks(layout)
++
++            def consume(index: int, view: memoryview) -> int:
++                crc = zlib.crc32(view)
++                _pwrite(fd, view, chunks[index].offset)
++                return crc
++
++            crcs = _device_to_host(chunks, [_bytes(storage)], consume)
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++        store.commit(
++            tmp,
++            {
++                "format": FORMAT,
++                "key": store.key,
++                "key_factors": store.factors,
++                "epoch": epoch,
++                "storage_bytes": storage.nbytes(),
++                "data_bytes": layout.data_bytes,
++                "chunk_bytes": _CHUNK,
++                "chunk_crc32": crcs,
++                "created": time.time(),
++            },
++        )
++    except BaseException:
++        shutil.rmtree(tmp, ignore_errors=True)
++        raise
++    return layout.data_bytes
++
++
++def restore_storage(
++    store: SnapshotDir,
++    storage: torch.UntypedStorage,
++    epoch: str,
++    *,
++    verify: bool = True,
++    direct: bool = True,
++) -> int:
++    """Overwrite the storage from ``store`` if it was written under ``epoch``.
++    SnapshotUnusable if it does not fit; SnapshotCorrupt if it fails an
++    integrity check (the storage may then be partly overwritten)."""
++    manifest = store.manifest()
++    if manifest.get("epoch") != epoch:
++        raise SnapshotUnusable(
++            f"rank snapshot is from save {manifest.get('epoch')}, the scheduler "
++            f"table from save {epoch}"
++        )
++    layout = _layout(storage)
++    if (
++        manifest.get("storage_bytes") != storage.nbytes()
++        or manifest.get("data_bytes") != layout.data_bytes
++    ):
++        raise SnapshotUnusable(
++            f"snapshot holds {manifest.get('storage_bytes')} KV bytes, the buffer "
++            f"is {storage.nbytes()}"
++        )
++    if manifest.get("chunk_bytes") != _CHUNK:
++        raise SnapshotUnusable("snapshot chunk size differs")
++    chunks = _chunks(layout)
++    crcs = manifest.get("chunk_crc32")
++    if not isinstance(crcs, list) or len(crcs) != len(chunks):
++        raise SnapshotCorrupt("snapshot chunk count differs")
++    path = store.path / DATA_FILE
++    try:
++        size = path.stat().st_size
++    except OSError as exc:
++        raise SnapshotCorrupt(f"data file unreadable: {exc}") from exc
++    if size != layout.data_bytes:
++        raise SnapshotCorrupt(
++            f"data file holds {size} bytes, expected {layout.data_bytes}"
++        )
++    flags = _open_flags(direct)
++    try:
++        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | flags)
++        try:
++            _host_to_device(fd, chunks, [_bytes(storage)], crcs if verify else None)
++        finally:
++            os.close(fd)
++    except Exception as exc:  # noqa: BLE001 - any read failure condemns the file
++        raise SnapshotCorrupt(f"{type(exc).__name__}: {exc}") from exc
++    return layout.data_bytes
++
++
++# ── worker side (collective_rpc targets; ``worker`` is the rank's worker) ──────
++
++
++def _rank_store(
++    worker: Any, engine_key: str, storage: torch.UntypedStorage
++) -> SnapshotDir:
++    runner = worker.model_runner
++    factors = rank_key_factors(
++        worker.vllm_config, runner.kv_cache_config, storage.nbytes(), engine_key
++    )
++    rank, world = factors["ranks"]["world"]
++    return SnapshotDir(
++        _root(), f"rank{rank:02d}of{world:02d}", _key_of(factors), factors
++    )
++
++
++def _rank_index() -> int:
++    try:
++        return _ranks()["world"][0]
++    except Exception:  # noqa: BLE001 - only for messages
++        return -1
++
++
++def _synchronize(storage: torch.UntypedStorage) -> None:
++    if storage.device.type == "cuda":
++        torch.accelerator.synchronize(storage.device)
++
++
++def rank_save(worker: Any, engine_key: str, epoch: str) -> dict[str, Any]:
++    """Write this rank's KV backing buffer. Never raises: a failure is
++    reported to the engine core, which then writes no table."""
++    rank = _rank_index()
++    start = time.perf_counter()
++    try:
++        storage = kv_storage(worker.model_runner)
++        store = _rank_store(worker, engine_key, storage)
++        _synchronize(storage)
++        nbytes = write_storage(store, storage, epoch, keep=_keep())
++    except Exception as exc:  # noqa: BLE001 - reported, the table is not written
++        logger.warning(
++            "KV snapshot rank %d not written (%s: %s)", rank, type(exc).__name__, exc
++        )
++        return {"ok": False, "rank": rank, "reason": f"{type(exc).__name__}: {exc}"}
++    elapsed = time.perf_counter() - start
++    logger.info(
++        "KV snapshot rank %d wrote %.2f GiB in %.2f s (%.2f GB/s) to %s",
++        rank,
++        _gib(nbytes),
++        elapsed,
++        nbytes / max(elapsed, 1e-9) / 1e9,
++        store.path,
++    )
++    return {"ok": True, "rank": rank, "bytes": nbytes, "seconds": elapsed}
++
++
++def rank_restore(worker: Any, engine_key: str, epoch: str) -> dict[str, Any]:
++    """Read this rank's KV backing buffer. Never raises; a corrupt snapshot
++    is deleted."""
++    rank = _rank_index()
++    start = time.perf_counter()
++    store = None
++    try:
++        storage = kv_storage(worker.model_runner)
++        store = _rank_store(worker, engine_key, storage)
++        nbytes = restore_storage(
++            store, storage, epoch, verify=_env_flag(ENV_VERIFY, "1")
++        )
++        _synchronize(storage)
++    except Exception as exc:  # noqa: BLE001 - reported, no rank's table is installed
++        corrupt = isinstance(exc, SnapshotCorrupt)
++        if corrupt and store is not None:
++            store.discard()
++        return {
++            "ok": False,
++            "rank": rank,
++            "corrupt": corrupt,
++            "reason": str(exc) or type(exc).__name__,
++        }
++    elapsed = time.perf_counter() - start
++    return {"ok": True, "rank": rank, "bytes": nbytes, "seconds": elapsed}
++
++
++def rank_discard(worker: Any, engine_key: str) -> bool:
++    """Delete this rank's snapshot for the key. Never raises."""
++    try:
++        storage = kv_storage(worker.model_runner)
++        _rank_store(worker, engine_key, storage).discard()
++    except Exception as exc:  # noqa: BLE001 - a leftover file is only disk space
++        logger.warning("KV snapshot rank %d not deleted (%s)", _rank_index(), exc)
++        return False
++    return True
++
++
++# ── the scheduler's prefix-cache table ──────────────────────────────────────────
++
++
++def check_quiesced(pool: BlockPool) -> None:
++    """Every block but the null block is free, so every hashed block's
++    contents are final."""
++    held = pool.num_gpu_blocks - 1 - pool.get_num_free_blocks()
++    if held:
++        raise RuntimeError(f"{held} KV cache blocks are still held by requests")
++
++
++def dump_table(pool: BlockPool) -> dict[str, Any]:
++    """The BlockPool's prefix-cache state: per-block hash keys, the hash map in
++    insertion order and the free queue in eviction order."""
++    check_quiesced(pool)
++    blocks = []
++    for block in pool.blocks:
++        extra = pool.cached_block_hashes_by_block.get(block.block_id)
++        if block.block_hash is None and not extra:
++            continue
++        blocks.append(
++            [
++                block.block_id,
++                None if block.block_hash is None else bytes(block.block_hash).hex(),
++                block.block_hash_num_tokens,
++                sorted(bytes(key).hex() for key in extra or ()),
++            ]
++        )
++    entries = []
++    for key, value in pool.cached_block_hash_to_block._cache.items():
++        ids = [value.block_id] if isinstance(value, KVCacheBlock) else list(value)
++        entries.append([bytes(key).hex(), ids])
++    return {
++        "num_blocks": pool.num_gpu_blocks,
++        "hash_block_size": pool.hash_block_size,
++        "free_order": [b.block_id for b in pool.free_block_queue.get_all_free_blocks()],
++        "blocks": blocks,
++        "entries": entries,
++    }
++
++
++@dataclasses.dataclass
++class TablePlan:
++    free_order: list[int]
++    blocks: list[tuple[int, bytes, int | None, list[bytes]]]
++    entries: list[tuple[bytes, list[int]]]
++
++    @property
++    def num_hashed_blocks(self) -> int:
++        return len(self.blocks)
++
++    @property
++    def num_entries(self) -> int:
++        return sum(len(ids) for _, ids in self.entries)
++
++
++def _key_bytes(text: Any) -> bytes:
++    if not isinstance(text, str):
++        raise SnapshotCorrupt(f"hash key {text!r} is not a string")
++    try:
++        key = bytes.fromhex(text)
++    except ValueError as exc:
++        raise SnapshotCorrupt(f"hash key {text[:16]}... is not hex") from exc
++    if len(key) <= 4:
++        raise SnapshotCorrupt("hash key too short")
++    return key
++
++
++def check_table(pool: BlockPool, table: dict[str, Any]) -> TablePlan:
++    """Validate a dumped table against a fresh pool. SnapshotUnusable if it
++    does not fit this pool, SnapshotCorrupt if it is inconsistent."""
++    num_blocks = pool.num_gpu_blocks
++    if table.get("num_blocks") != num_blocks:
++        raise SnapshotUnusable(
++            f"table has {table.get('num_blocks')} blocks, the pool {num_blocks}"
++        )
++    if table.get("hash_block_size") != pool.hash_block_size:
++        raise SnapshotUnusable("table hash block size differs")
++    if (
++        pool.get_num_free_blocks() != num_blocks - 1
++        or len(pool.cached_block_hash_to_block)
++        or pool.cached_block_hashes_by_block
++        or any(b.block_hash is not None for b in pool.blocks)
++    ):
++        raise SnapshotUnusable("the prefix cache is not empty")
++    try:
++        free_order = [int(i) for i in table["free_order"]]
++        raw_blocks = table["blocks"]
++        raw_entries = table["entries"]
++    except (KeyError, TypeError, ValueError) as exc:
++        raise SnapshotCorrupt(f"malformed table: {exc}") from exc
++    if len(free_order) != num_blocks - 1 or set(free_order) != set(
++        range(1, num_blocks)
++    ):
++        raise SnapshotCorrupt("free queue is not a permutation of the pool's blocks")
++
++    pairs: set[tuple[bytes, int]] = set()
++    blocks: list[tuple[int, bytes, int | None, list[bytes]]] = []
++    seen: set[int] = set()
++    for item in raw_blocks:
++        try:
++            block_id, primary, num_tokens, extra = item
++        except (TypeError, ValueError) as exc:
++            raise SnapshotCorrupt(f"malformed block record {item!r}") from exc
++        if (
++            not isinstance(block_id, int)
++            or not 0 < block_id < num_blocks
++            or block_id in seen
++        ):
++            raise SnapshotCorrupt(f"block id {block_id!r} out of range or repeated")
++        seen.add(block_id)
++        if primary is None:
++            raise SnapshotCorrupt(f"block {block_id} has extra keys but no primary key")
++        if num_tokens is not None and (
++            not isinstance(num_tokens, int) or num_tokens <= 0
++        ):
++            raise SnapshotCorrupt(f"block {block_id} has token count {num_tokens!r}")
++        primary_key = _key_bytes(primary)
++        extra_keys = [_key_bytes(k) for k in extra]
++        if primary_key in extra_keys or len(set(extra_keys)) != len(extra_keys):
++            raise SnapshotCorrupt(f"block {block_id} repeats a hash key")
++        blocks.append((block_id, primary_key, num_tokens, extra_keys))
++        pairs.add((primary_key, block_id))
++        pairs.update((k, block_id) for k in extra_keys)
++
++    entries: list[tuple[bytes, list[int]]] = []
++    keys: set[bytes] = set()
++    listed: set[tuple[bytes, int]] = set()
++    for item in raw_entries:
++        try:
++            text, ids = item
++            ids = [int(i) for i in ids]
++        except (TypeError, ValueError) as exc:
++            raise SnapshotCorrupt(f"malformed hash entry {item!r}") from exc
++        key = _key_bytes(text)
++        if key in keys or not ids or len(set(ids)) != len(ids):
++            raise SnapshotCorrupt("hash entry repeated or with repeated blocks")
++        keys.add(key)
++        listed.update((key, i) for i in ids)
++        entries.append((key, ids))
++    if listed != pairs:
++        raise SnapshotCorrupt(
++            f"hash map and block keys disagree ({len(listed ^ pairs)} pairs)"
++        )
++    return TablePlan(free_order, blocks, entries)
++
++
++def install_table(pool: BlockPool, plan: TablePlan) -> None:
++    """Install a checked table into the fresh pool it was checked against."""
++    queue = pool.free_block_queue
++    queue.popleft_n(queue.num_free_blocks)
++    queue.append_n([pool.blocks[i] for i in plan.free_order])
++    for block_id, primary, num_tokens, extra in plan.blocks:
++        pool.blocks[block_id].set_block_hash(primary, num_tokens=num_tokens)
++        if extra:
++            pool.cached_block_hashes_by_block[block_id] = set(extra)
++    for key, ids in plan.entries:
++        for block_id in ids:
++            pool.cached_block_hash_to_block.insert(key, pool.blocks[block_id])
++
++
++def rank_failures(results: list[dict[str, Any]], what: str) -> list[str]:
++    """One message per rank that did not succeed (empty if all did)."""
++    failures = []
++    for index, result in enumerate(results):
++        if not isinstance(result, dict) or not result.get("ok"):
++            reason = result.get("reason") if isinstance(result, dict) else repr(result)
++            failures.append(f"rank {index} {what}: {reason}")
++    return failures
++
++
++# ── the engine core side ────────────────────────────────────────────────────────
++
++
++class KVSnapshot:
++    """The engine core's save and restore (see the module docstring)."""
++
++    def __init__(
++        self,
++        engine: Any,
++        kv_cache_config: Any,
++        scheduler_block_size: int,
++        hash_block_size: int,
++    ):
++        self.engine = engine
++        self.reason = self._unsupported(kv_cache_config)
++        self.store: SnapshotDir | None = None
++        if self.reason is None:
++            try:
++                factors = engine_key_factors(
++                    engine.vllm_config,
++                    kv_cache_config,
++                    scheduler_block_size,
++                    hash_block_size,
++                )
++                self.store = SnapshotDir(
++                    _root(), SCHEDULER_PREFIX, _key_of(factors), factors
++                )
++            except Exception as exc:  # noqa: BLE001 - a key we cannot form means no snapshot
++                self.reason = f"cannot key a snapshot: {type(exc).__name__}: {exc}"
++
++    @classmethod
++    def for_engine(
++        cls,
++        engine: Any,
++        kv_cache_config: Any,
++        scheduler_block_size: int,
++        hash_block_size: int,
++    ) -> KVSnapshot | None:
++        if not enabled():
++            return None
++        return cls(engine, kv_cache_config, scheduler_block_size, hash_block_size)
++
++    @property
++    def key(self) -> str:
++        assert self.store is not None
++        return self.store.key
++
++    def _pool(self) -> BlockPool:
++        return self.engine.scheduler.kv_cache_manager.block_pool
++
++    def _unsupported(self, kv_cache_config: Any) -> str | None:
++        from vllm.utils.hashing import get_hash_fn_by_name
++        from vllm.v1.core import kv_cache_utils
++
++        config = self.engine.vllm_config
++        cache = config.cache_config
++        if not cache.enable_prefix_caching:
++            return "prefix caching is off"
++        if config.parallel_config.data_parallel_size > 1:
++            return "data parallel engines are not supported"
++        if not kv_cache_config.kv_cache_groups:
++            return "the model has no KV cache"
++        if any(g.host_resident for g in kv_cache_config.kv_cache_groups):
++            return "host-resident KV cache groups (HiSparse)"
++        scheduler = self.engine.scheduler
++        if getattr(scheduler, "connector", None) is not None:
++            return "a KV connector is configured"
++        manager = getattr(scheduler, "kv_cache_manager", None)
++        pool = getattr(manager, "block_pool", None)
++        if type(pool) is not BlockPool:
++            return f"unsupported block pool {type(pool).__name__}"
++        if not pool.enable_caching:
++            return "the block pool does not cache"
++        if pool.boundary_checkpoints is not None:
++            return "boundary checkpoints are not snapshotted"
++        if pool.enable_kv_cache_events:
++            return "KV cache events are enabled"
++        hash_fn = get_hash_fn_by_name(cache.prefix_caching_hash_algo)
++        if (
++            hash_fn in kv_cache_utils._NON_CRYPTO_HASH_FUNCTIONS
++            and os.getenv("PYTHONHASHSEED") is None
++        ):
++            return "the NONE_HASH seed is random per process"
++        return None
++
++    # ── restore ──
++
++    def restore(self) -> None:
++        """Restore the prefix cache at engine start, on every rank or none."""
++        if self.reason is not None:
++            logger.info("KV snapshot not restored (%s)", self.reason)
++            return
++        store = self.store
++        assert store is not None
++        start = time.perf_counter()
++        try:
++            manifest = store.manifest()
++            epoch = manifest["epoch"]
++            plan = check_table(self._pool(), manifest["table"])
++        except Exception as exc:  # noqa: BLE001 - any doubt starts with an empty cache
++            if isinstance(exc, (SnapshotCorrupt, KeyError)):
++                store.discard()
++                logger.warning(
++                    "KV snapshot table at %s is corrupt (%s); deleted it, starting "
++                    "with an empty prefix cache",
++                    store.path,
++                    exc,
++                )
++            else:
++                logger.info("KV snapshot not restored (%s)", exc)
++            return
++        results = self.engine.collective_rpc(rank_restore, args=(store.key, epoch))
++        failures = rank_failures(results, "not restored")
++        if failures:
++            if any(isinstance(r, dict) and r.get("corrupt") for r in results):
++                # The set can never be complete again.
++                store.discard()
++            logger.warning(
++                "KV snapshot not restored on every rank (%s); starting with an empty "
++                "prefix cache",
++                "; ".join(failures),
++            )
++            return
++        install_table(self._pool(), plan)
++        elapsed = time.perf_counter() - start
++        nbytes = results[0]["bytes"]
++        slowest = max(r["seconds"] for r in results)
++        logger.info(
++            "KV snapshot restored %.2f GiB per rank x %d ranks, %d cached blocks "
++            "(%d hash entries) in %.2f s (slowest rank read %.2f GB/s) from save %s",
++            _gib(nbytes),
++            len(results),
++            plan.num_hashed_blocks,
++            plan.num_entries,
++            elapsed,
++            nbytes / max(slowest, 1e-9) / 1e9,
++            epoch,
++        )
++
++    # ── save ──
++
++    def save(self, abort: bool) -> dict[str, Any] | Future:
++        """Save now if the engine is idle; with ``abort``, pause (aborting
++        every request), save once no step is in flight, and resume."""
++        if self.reason is not None:
++            raise RuntimeError(f"KV snapshots unavailable: {self.reason}")
++        engine = self.engine
++        busy = engine.scheduler.has_requests() or bool(engine.batch_queue)
++        if not busy:
++            return self._save()
++        if not abort:
++            raise RuntimeError(
++                "requests are running; save when idle, or pass abort=true to abort them"
++            )
++        from vllm.v1.core.sched.interface import PauseState
++
++        was_unpaused = engine.scheduler.pause_state == PauseState.UNPAUSED
++        logger.info("KV snapshot: pausing the scheduler (aborting requests) to save")
++        paused = engine.pause_scheduler(mode="abort", clear_cache=False)
++
++        def finish() -> dict[str, Any]:
++            try:
++                return self._save()
++            finally:
++                if was_unpaused:
++                    engine.resume_scheduler()
++
++        if paused is None:
++            return finish()
++        result: Future = Future()
++
++        def on_paused(future: Future) -> None:
++            try:
++                future.result()
++                result.set_result(finish())
++            except BaseException as exc:  # noqa: BLE001 - handed to the caller
++                result.set_exception(exc)
++
++        paused.add_done_callback(on_paused)
++        return result
++
++    def _save(self) -> dict[str, Any]:
++        store = self.store
++        assert store is not None
++        start = time.perf_counter()
++        scheduler = self.engine.scheduler
++        drain: Callable[[], None] | None = getattr(
++            scheduler, "_drain_deferred_frees", None
++        )
++        if drain is not None:
++            drain()
++        if getattr(scheduler, "deferred_frees", None):
++            raise RuntimeError("blocks are awaiting a deferred free")
++        if getattr(self.engine.model_executor, "is_sleeping", False):
++            raise RuntimeError("the engine is sleeping")
++        pool = self._pool()
++        table = dump_table(pool)
++        # The old table goes first: from here until the new one is written no
++        # set of rank snapshots is restorable.
++        store.discard()
++        if not table["blocks"]:
++            # Nothing to restore: drop the old snapshot rather than leave a
++            # cache the engine no longer holds (e.g. after a prefix-cache reset).
++            self.engine.collective_rpc(rank_discard, args=(store.key,))
++            logger.info("KV snapshot: the prefix cache is empty; nothing saved")
++            return {"saved": True, "cached_blocks": 0, "bytes_per_rank": 0}
++        epoch = uuid.uuid4().hex
++        results = self.engine.collective_rpc(rank_save, args=(store.key, epoch))
++        failures = rank_failures(results, "not written")
++        if failures:
++            reason = "; ".join(failures)
++            logger.warning("KV snapshot not saved (%s)", reason)
++            return {"saved": False, "reason": reason}
++        tmp = store.begin(_keep())
++        try:
++            store.commit(
++                tmp,
++                {
++                    "format": FORMAT,
++                    "key": store.key,
++                    "key_factors": store.factors,
++                    "epoch": epoch,
++                    "ranks": len(results),
++                    "table": table,
++                    "created": time.time(),
++                },
++            )
++        except BaseException:
++            shutil.rmtree(tmp, ignore_errors=True)
++            raise
++        elapsed = time.perf_counter() - start
++        nbytes = results[0]["bytes"]
++        summary = {
++            "saved": True,
++            "epoch": epoch,
++            "ranks": len(results),
++            "bytes_per_rank": nbytes,
++            "cached_blocks": len(table["blocks"]),
++            "hash_entries": sum(len(ids) for _, ids in table["entries"]),
++            "seconds": round(elapsed, 3),
++            "path": str(store.path),
++        }
++        logger.info(
++            "KV snapshot saved %.2f GiB per rank x %d ranks, %d cached blocks "
++            "(%d hash entries) in %.2f s (slowest rank wrote %.2f GB/s) as save %s",
++            _gib(nbytes),
++            len(results),
++            summary["cached_blocks"],
++            summary["hash_entries"],
++            elapsed,
++            nbytes / max(max(r["seconds"] for r in results), 1e-9) / 1e9,
++            epoch,
++        )
++        return summary
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index cb0d8c89a..8b73c27c1 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -1091,6 +1091,10 @@ class AsyncLLM(EngineClient):
+             reset_running_requests, reset_connector
+         )
+ 
++    async def save_kv_snapshot(self, abort: bool = False) -> dict[str, Any]:
++        """Save the prefix cache for the next start (DSV41_KV_PERSIST=1)."""
++        return await self.engine_core.call_utility_async("save_kv_snapshot", abort)
++
+     async def get_prefill_fairness(self) -> dict[str, Any]:
+         return await self.engine_core.get_prefill_fairness_async()
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 49d1f7fe1..06a34d119 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -54,6 +54,7 @@ from vllm.v1.core.kv_cache_utils import (
+     resolve_kv_cache_block_sizes,
+     update_kv_cache_capacity,
+ )
++from vllm.v1.core.kv_snapshot import KVSnapshot
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+@@ -243,6 +244,14 @@ class EngineCore:
+                 hash_block_size, caching_hash_fn
+             )
+ 
++        # DSV41_KV_PERSIST=1: restore the prefix cache saved before the last
++        # stop (workers are past warmup, the scheduler's pool is still empty).
++        self.kv_snapshot = KVSnapshot.for_engine(
++            self, kv_cache_config, scheduler_block_size, hash_block_size
++        )
++        if self.kv_snapshot is not None:
++            self.kv_snapshot.restore()
++
+         self.step_fn = (
+             self.step if self.batch_queue is None else self.step_with_batch_queue
+         )
+@@ -914,6 +923,16 @@ class EngineCore:
+             reset_running_requests, reset_connector
+         )
+ 
++    def save_kv_snapshot(self, abort: bool = False) -> dict[str, Any] | Future:
++        """Save the prefix cache for the next start (DSV41_KV_PERSIST=1).
++
++        Refuses while requests are running unless ``abort``, which pauses the
++        scheduler (aborting them), saves once no step is in flight, and
++        resumes."""
++        if self.kv_snapshot is None:
++            raise RuntimeError("KV snapshots are off (DSV41_KV_PERSIST=0)")
++        return self.kv_snapshot.save(abort)
++
+     def get_prefill_fairness(self) -> dict[str, Any]:
+         return self.scheduler.get_prefill_fairness()
+ 

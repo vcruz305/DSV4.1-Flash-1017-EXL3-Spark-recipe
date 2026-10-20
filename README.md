@@ -36,9 +36,9 @@ shards are ~101.5 GB each), the alias side file **8.6 GiB**, the base engine ima
 read cold experts from, and keep it well short of full (see "Keep the disk quiet").
 `download_and_verify.sh` and `build_cold_alias.sh` check free space before writing.
 
-Host prerequisites: passwordless `sudo -n docker`, the base engine image (see
-`scripts/build_image.sh`), and `huggingface_hub` with `hf_xet` for the host-side
-download. On a stock Ubuntu 24.04 the documented install needs
+Host prerequisites: passwordless `sudo -n docker`, the base engine image
+`dsv41-1017-ds41f:r6w` (built from `base/`, see `base/README.md`; CPU only, several hours), and
+`huggingface_hub` with `hf_xet` for the host-side download. On a stock Ubuntu 24.04 the documented install needs
 `--break-system-packages` (PEP 668 marks the system python externally managed):
 
 ```bash
@@ -554,20 +554,22 @@ side file only works because device and host memory are the same pool.
 ## Pack revision
 
 The numbers were measured on a pack downloaded at revision `7cdebca3`. The Hub
-repo's history has since been replaced twice, each time with a single
-`Initial commit` holding the same files (`04f7138b`, then `2a6059359c68`), so old
-commit ids stop resolving. `scripts/env.sh` pins the current one,
-`2a6059359c685cd0ea66e1e6c34e6803322ff095`; the Hub revision has 24 files and the
+repo's history has since been replaced three times, each time with a single
+`Initial commit` holding the same weights (`04f7138b`, `2a6059359c68`, then
+`c852150e06f5`), so old commit ids stop resolving. `scripts/env.sh` pins the current
+one, `c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960`; the Hub revision has 27 files and the
 21 this recipe needs all match `scripts/SHA256SUMS` (sha256 of the 17 shards, the
-index, `config.json`, `tokenizer.json` and `tokenizer_config.json`). The other
-three (`.gitattributes`, `LICENSE`, `README.md`) are not used at serve time.
+index, `config.json`, `tokenizer.json` and `tokenizer_config.json`; checked
+2026-10-20). The other six (`.gitattributes`, `LICENSE`, `README.md`,
+`chat_template.jinja`, `engram_token_map.u32`, `generation_config.json`) are not in
+`SHA256SUMS`.
 
 **`scripts/SHA256SUMS` is the authority, not the commit id.** If the pinned
 revision is gone, `download_and_verify.sh` downloads `main` with a warning and
 the sha256 check decides whether it is the measured pack. A mismatch means the
 weights changed; do not serve it as this recipe.
 
-The Hub revision does not ship `engram_token_map.u32` (517,120 B) or
+Earlier Hub revisions did not ship `engram_token_map.u32` (517,120 B) or
 `chat_template.jinja` (4,015 B), both of which exist in the measurement box's
 copy of the pack. Neither is in `SHA256SUMS` and neither is required: a
 from-scratch install without them boots, passes `smoke.sh`, answers
@@ -579,9 +581,10 @@ from-scratch install without them boots, passes `smoke.sh`, answers
 
 - Engine: [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f)
   release r6w (Apache-2.0): vLLM fork, TileLang SM121 kernels, DeepSeek
-  TileKernels, sparknet. The base image is built per
-  [justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark](https://github.com/justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark)
-  `docker/Dockerfile`.
+  TileKernels, sparknet. The base image is built by `base/docker/Dockerfile`:
+  justincasey's DeepSeek-V4.1-Flash-1017-4x-DGX-Spark recipe at `fa77c26`
+  (Apache-2.0, its `LICENSE` and `NOTICE` kept in `base/`), copied unmodified because
+  that repository is no longer online.
 - Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels
   with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
 - Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by

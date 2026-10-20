@@ -1,9 +1,9 @@
 # Serving image for vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw on one DGX Spark.
 #
 #   base : dsv41-1017-ds41f:r6w   Christopher Owen's spark-ds41f r6w (upstreams
-#                                 pinned at 2dc95329), built per
-#                                 justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark
-#                                 docker/Dockerfile. The FP8 block-32 TileLang
+#                                 pinned at 2dc95329), built by base/docker/Dockerfile
+#                                 (justincasey's 4x recipe at fa77c26, kept in base/).
+#                                 The FP8 block-32 TileLang
 #                                 linears, attention, Engram io_uring reader and
 #                                 the loader stay exactly as that recipe pinned them.
 #   +    : vcruz305/vllm-exl3     Exl3MoEMethod / ATS loader
