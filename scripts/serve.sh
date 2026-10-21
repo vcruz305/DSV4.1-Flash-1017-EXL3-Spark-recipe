@@ -249,7 +249,17 @@ echo "preflight" >"$RUN/stage"
 # The awk program goes in as an argument: a single-quoted program inside the
 # single-quoted bash -c body would end the outer quote and kill the watcher.
 READY_MEM_AWK='/^Cached:/{c=$2} /^MemFree:/{f=$2} END{printf "page cache %.2f GiB, free %.2f GiB\n", c/1048576, f/1048576}'
-setsid nohup bash -c '
+# The two background processes below live as long as the server. They must not inherit
+# the caller's open files: under `flock LOCK bash scripts/serve.sh`, the sudo processes kept
+# the lock's descriptor and the lock stayed held until the server was stopped.
+no_inherited_fds() {
+  local fd
+  for fd in $(ls /proc/$BASHPID/fd); do
+    [ "$fd" -gt 2 ] && eval "exec $fd>&-" 2>/dev/null
+  done
+  exec "$@"
+}
+(no_inherited_fds setsid nohup bash -c '
   sudo -n docker logs -f "$1" 2>&1 | while IFS= read -r line; do
     case "$line" in
       *"Starting to load model"*)       echo "load-weights" >"$2/stage" ;;
@@ -258,7 +268,7 @@ setsid nohup bash -c '
       *"Application startup complete"*) echo "ready" >"$2/stage"; : >"$3/.warm"
         awk "$4" /proc/meminfo >"$2/ready-mem" ;;
     esac
-  done' _ "$CONTAINER" "$RUN" "$JIT_HOST" "$READY_MEM_AWK" >/dev/null 2>&1 &
+  done' _ "$CONTAINER" "$RUN" "$JIT_HOST" "$READY_MEM_AWK") >/dev/null 2>&1 &
 echo "stage watcher: pid $!"
 
 # ---- ready-state page-cache split ------------------------------------------
@@ -272,7 +282,7 @@ echo "stage watcher: pid $!"
 # $RUN/ready-mem when the server reports ready (see "Keep the disk quiet").
 
 # ---- memory guard ---------------------------------------------------------
-sudo -n setsid nohup bash "$HERE/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP" \
+(no_inherited_fds sudo -n setsid nohup bash "$HERE/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP") \
   >/dev/null 2>&1 &
 for _ in $(seq 1 100); do grep -q "guard: armed" "$RUN/guard.log" 2>/dev/null && break; sleep 0.1; done
 if ! grep -q "guard: armed" "$RUN/guard.log" 2>/dev/null; then

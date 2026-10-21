@@ -9,6 +9,15 @@ online. They are byte-identical to the build directory the measurement Spark use
 Christopher Owen's [spark-ds41f](https://github.com/christopherowen/spark-ds41f) (Apache-2.0) r6w,
 fetched at build time at commit `2dc95329`.
 
+**Prebuilt (default).** `scripts/build_image.sh` does not build this image. When it is
+missing, `scripts/fetch_base.sh` downloads the redistributable copy published at
+[vcruz305/DSV4.1-Flash-1017-Spark-base-image](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-Spark-base-image)
+(the source build of these files with NVIDIA CUTLASS DSL removed, flattened to one layer), checks it,
+and reinstalls CUTLASS DSL 4.7.1 from PyPI with `Dockerfile.cutlass-dsl` and `cutlass-dsl.lock`
+(sha256-pinned wheels). CUTLASS DSL's licence allows redistributing only its Python source, which is
+why it is not in the published image. See the main README, "Base image".
+
+**From source.** `BASE_FROM_SOURCE=1 bash scripts/build_image.sh`, or by hand.
 Build (CPU only, no GPU needed; several hours, ~100+ GB of disk for the build, as much RAM as you can
 give it), from the recipe root:
 
@@ -19,4 +28,6 @@ sudo docker build --platform linux/arm64 -f base/docker/Dockerfile -t dsv41-1017
 The build fetches pinned inputs from Docker Hub (the vLLM nightly image by digest), GitHub
 (spark-ds41f, Local Inference Lab vLLM and B12X, TileLang, TileKernels, NCCL, CUTLASS,
 dgx-spark-networking) and PyPI (hash-locked wheels). These files are kept as the source of record;
-this exact rebuild has not been rerun by us since 2026-10-18.
+a rebuild on 2026-10-20 (Apple Silicon, Docker Desktop, 12 CPUs, 18.5 min) reproduced every
+source file and every label of the 2026-10-18 build; only compiled binaries and build logs differ
+(see the main README, "Base image").

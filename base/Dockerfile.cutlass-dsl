@@ -1,0 +1,14 @@
+# Turns the redistributable base (dsv41-1017-ds41f:r6w-redist, from Hugging Face) back into the
+# base the recipe was measured on: installs NVIDIA CUTLASS DSL 4.7.1 from PyPI. Its licence allows
+# redistributing only the Python source, so the published base ships without it and every user
+# downloads it from NVIDIA's PyPI release here. cutlass-dsl.lock pins the five wheels by URL and
+# sha256; they are the wheels base/docker/Dockerfile installs. With them, the image matches the
+# source build of base/docker/Dockerfile file for file except bytecode caches and pip's
+# RECORD/REQUESTED/direct_url.json (manifest-r6w-src.txt.zst in the Hugging Face repo).
+# Run by scripts/fetch_base.sh.
+ARG REDIST_IMAGE=dsv41-1017-ds41f:r6w-redist
+FROM ${REDIST_IMAGE}
+COPY cutlass-dsl.lock /tmp/cutlass-dsl.lock
+RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall --require-hashes -r /tmp/cutlass-dsl.lock \
+ && rm /tmp/cutlass-dsl.lock
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 -c "import importlib.metadata as m; assert m.version('nvidia-cutlass-dsl') == '4.7.1'; import cutlass.base_dsl.enums, quack.compile_utils, b12x.attention.compressed_sparse_mla, b12x.comm.roce, b12x.integration.vllm.loader, b12x.sequence.engram; print('imports ok')"

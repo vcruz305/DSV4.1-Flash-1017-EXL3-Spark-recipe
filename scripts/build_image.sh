@@ -3,8 +3,9 @@
 #
 #   FORK_REF=<sha> PLUGIN_REF=<sha> bash scripts/build_image.sh
 #
-# The base image is not built here. If it is missing, this prints the command
-# that builds it from the 4x recipe.
+# If the base image is missing, scripts/fetch_base.sh fetches it from Hugging Face
+# (8.8 GB; see README "Base image"). BASE_FROM_SOURCE=1 builds it from base/ instead
+# (CPU only, hours).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,17 +14,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 
 if ! sudo -n docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
-  cat >&2 <<EOF
-Base image $BASE_IMAGE is not present.
-
-Build it once from the files in base/ (CPU only, several hours; see base/README.md):
-
-  sudo docker build --platform linux/arm64 -f "$RECIPE_HOME/base/docker/Dockerfile" -t $BASE_IMAGE "$RECIPE_HOME/base"
-
-That image is Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329) with the
-patches listed in base/NOTICE.
-EOF
-  exit 1
+  if [ "${BASE_FROM_SOURCE:-0}" = 1 ]; then
+    echo "building $BASE_IMAGE from base/ (CPU only, hours; see base/README.md)"
+    sudo -n docker build --platform linux/arm64 -f "$RECIPE_HOME/base/docker/Dockerfile" \
+      -t "$BASE_IMAGE" "$RECIPE_HOME/base"
+  else
+    bash "$HERE/fetch_base.sh"
+  fi
 fi
 
 echo "base   : $BASE_IMAGE"
