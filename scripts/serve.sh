@@ -48,7 +48,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  VLLM_USE_FLASHINFER_SAMPLER=1 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
   echo "  DSV41_DSML_STOP=$DSML_STOP DSV41_DSML_PARAM_REPAIR=$DSML_PARAM_REPAIR"
   echo
-  echo "vllm serve /models/$MODEL_NAME --served-model-name dsv41 --tokenizer-mode deepseek_v41 \\"
+  echo "vllm serve /models/$MODEL_NAME --served-model-name $SERVED_MODEL_NAME --tokenizer-mode deepseek_v41 \\"
   echo "  --dtype bfloat16 --tensor-parallel-size 1 --distributed-executor-backend uni \\"
   echo "  --quantization exl3_dsv41 --block-size 256 $PCF --enable-chunked-prefill \\"
   echo "  --max-model-len $MAXLEN --max-num-seqs 1 --max-parallel-prefills 1 \\"
@@ -179,6 +179,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -v "$HERE/serve_inner.sh":/root/serve.sh:ro \
   -p "$API_PORT":8000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
   -e B12X_AUTOTUNE=0 \
   -e B12X_BIND_COMPILE_WORKERS="${B12X_BIND_COMPILE_WORKERS:-2}" \
   -e B12X_STATE_COMPILE_WORKERS="${B12X_STATE_COMPILE_WORKERS:-2}" \

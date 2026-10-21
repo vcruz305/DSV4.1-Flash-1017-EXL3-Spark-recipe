@@ -5,6 +5,7 @@ Plain text prompts only (repeated words) via /v1/completions, so no chat
 template / special-token handling is involved. Stops at the first failure and
 prints whatever the server returned.
 """
+import os
 import json
 import sys
 import time
@@ -27,7 +28,7 @@ def prompt_of(target_tokens: int) -> str:
 
 def run(target: int, max_tokens: int = 8):
     body = {
-        "model": "dsv41",
+        "model": os.environ.get("SERVED_MODEL_NAME", "dsv41"),
         "prompt": prompt_of(target),
         "max_tokens": max_tokens,
         "temperature": 0,

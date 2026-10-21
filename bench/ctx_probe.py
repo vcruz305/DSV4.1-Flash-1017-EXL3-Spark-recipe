@@ -22,7 +22,7 @@ import urllib.request
 base, target, out = sys.argv[1].rstrip("/"), int(sys.argv[2]), sys.argv[3]
 depth = float(sys.argv[4]) if len(sys.argv) > 4 else 0.5
 ndec = int(sys.argv[5]) if len(sys.argv) > 5 else 384
-MODEL = "dsv41"
+MODEL = os.environ.get("SERVED_MODEL_NAME", "dsv41")
 
 
 def post(path, body, timeout):

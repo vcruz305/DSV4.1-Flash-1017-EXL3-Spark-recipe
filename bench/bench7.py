@@ -69,7 +69,7 @@ def scrape():
 
 
 def gen(prompt, max_tokens):
-    body = {"model": "dsv41", "prompt": prompt, "max_tokens": max_tokens, "temperature": 0,
+    body = {"model": os.environ.get("SERVED_MODEL_NAME", "dsv41"), "prompt": prompt, "max_tokens": max_tokens, "temperature": 0,
             "stream": True, "stream_options": {"include_usage": True}, "ignore_eos": True}
     req = urllib.request.Request(URL, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})

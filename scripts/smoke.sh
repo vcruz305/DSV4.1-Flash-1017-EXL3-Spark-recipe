@@ -4,11 +4,12 @@
 set -euo pipefail
 
 API_PORT="${API_PORT:-8000}"
+MODEL_ID="${SERVED_MODEL_NAME:-dsv41}"
 BASE="http://127.0.0.1:${API_PORT}/v1"
 
 # `set -e` plus a failing command substitution exits silently; say what failed.
 if ! RESP=$(curl -s -m 300 "$BASE/completions" -H 'Content-Type: application/json' -d '{
-  "model": "dsv41",
+  "model": "'"$MODEL_ID"'",
   "prompt": "The capital of France is",
   "max_tokens": 16,
   "temperature": 0,
