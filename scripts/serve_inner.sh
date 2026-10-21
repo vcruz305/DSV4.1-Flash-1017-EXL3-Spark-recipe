@@ -27,7 +27,7 @@ PCF=--enable-prefix-caching
 echo "dsv41 serve: model=$MODEL_DIR maxlen=$MAXLEN kv=$KVB mnbt=$MNBT lpt=$LPT mtp_k=$MTP_K graphs=$CG_MODE prefix_caching=${PREFIX_CACHING:-1}"
 
 exec vllm serve "$MODEL_DIR" \
-    --served-model-name dsv41 \
+    --served-model-name "${SERVED_MODEL_NAME:-dsv41}" \
     --host 0.0.0.0 --port 8000 \
     --tokenizer-mode deepseek_v41 \
     --dtype bfloat16 \

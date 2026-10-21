@@ -4,6 +4,7 @@
 Usage: python3 prefill_varied_probe.py 2048,8192,16384,30000
 Prints one line per length: target, prompt_tokens, TTFT s, prefill tok/s, MemAvailable min (GiB).
 """
+import os
 import glob, json, os, sys, time, threading, urllib.request
 
 URL = "http://127.0.0.1:8000/v1/completions"
@@ -36,7 +37,7 @@ def memavail():
 def run(text, target, offset):
     # ~3.3 chars/token for python source; generous, then report real prompt_tokens
     chunk = text[offset: offset + int(target * 3.3)]
-    body = {"model": "dsv41", "prompt": chunk, "max_tokens": 4, "temperature": 0,
+    body = {"model": os.environ.get("SERVED_MODEL_NAME", "dsv41"), "prompt": chunk, "max_tokens": 4, "temperature": 0,
             "stream": True, "stream_options": {"include_usage": True}, "ignore_eos": True}
     req = urllib.request.Request(URL, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})

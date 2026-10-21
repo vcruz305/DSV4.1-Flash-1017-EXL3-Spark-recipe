@@ -11,6 +11,7 @@ that asks for the passphrase and a summary), then sends the same greedy streamed
 hits / queries over the request), found, and the head of the answer. Run it on an idle server:
 the counters are server-wide.
 """
+import os
 import json, os, random, sys, time, urllib.request
 target = int(sys.argv[1]); ndec = int(sys.argv[2]); out = sys.argv[3]
 base = (sys.argv[4] if len(sys.argv) > 4 else "http://127.0.0.1:8000").rstrip("/")
@@ -33,16 +34,16 @@ def line(i):
             f"(shard {rng.randrange(0, 256)}, user {rng.randrange(10**5, 10**6)})\n")
 ph = f"silver-meadow-{rng.randrange(1000, 9999)}-heron"
 q = "\nEnd of log.\nQuestion: what is the secret passphrase on the NOTE line above? Answer with the passphrase, then summarize the log in a few paragraphs.\nAnswer: The secret passphrase is"
-per = post("/tokenize", {"model": "dsv41", "prompt": "".join(line(i) for i in range(200))}, 300)["count"] / 200
+per = post("/tokenize", {"model": os.environ.get("SERVED_MODEL_NAME", "dsv41"), "prompt": "".join(line(i) for i in range(200))}, 300)["count"] / 200
 n = int((target - 200) / per)
 lines = [f"log export {os.urandom(8).hex()}\n"] + [line(i) for i in range(n)]
 lines.insert(n // 2, f"NOTE: the secret passphrase for this log is {ph}. Remember it.\n")
 text = "".join(lines) + q
-while post("/tokenize", {"model": "dsv41", "prompt": text}, 300)["count"] > target:
+while post("/tokenize", {"model": os.environ.get("SERVED_MODEL_NAME", "dsv41"), "prompt": text}, 300)["count"] > target:
     del lines[-40:-1]; text = "".join(lines) + q
 for label in ("cold", "cached_1", "cached_2"):
     m0 = metrics(); t0 = time.time(); tf = None; parts = []; usage = {}
-    body = {"model": "dsv41", "prompt": text, "max_tokens": ndec, "temperature": 0, "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
+    body = {"model": os.environ.get("SERVED_MODEL_NAME", "dsv41"), "prompt": text, "max_tokens": ndec, "temperature": 0, "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
     r = urllib.request.Request(base + "/v1/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     with urllib.request.urlopen(r, timeout=7200) as f:
         for raw in f:
