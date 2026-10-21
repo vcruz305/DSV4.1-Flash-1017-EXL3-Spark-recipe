@@ -30,18 +30,20 @@ at `--max-model-len 32768` and 3.1-3.2 GiB at the shipped default of 524,288.
 
 Disk, measured on the measurement box: the pack is **326.6 GB** (304 GiB; two
 shards are ~101.5 GB each), the alias side file **8.6 GiB**, the base engine image
-**34.9 GB**, and the derived image adds **~2 GB** on top of it (36.9 GB as listed by
-`docker images`, shared layers). The first boot adds a few GB of JIT cache under
+**34.9 GB** (fetched from Hugging Face instead: an 8.8 GB download, deleted after loading, and
+**~33 GB** in docker for the base plus our layer, measured), and the derived image adds **~2 GB**
+on top of it (36.9 GB as listed by `docker images`, shared layers). The first boot adds a few GB of JIT cache under
 `~/.cache/dsv41-ds41f/kkref/jit`. Budget **~400 GB free** on the NVMe the serve will
 read cold experts from, and keep it well short of full (see "Keep the disk quiet").
 `download_and_verify.sh` and `build_cold_alias.sh` check free space before writing.
 
-Host prerequisites: passwordless `sudo -n docker`, the base engine image
-`dsv41-1017-ds41f:r6w` (built from `base/`, see `base/README.md`; CPU only, several hours), and
-`huggingface_hub` with `hf_xet` for the host-side download. On a stock Ubuntu 24.04 the documented install needs
+Host prerequisites: passwordless `sudo -n docker`, `zstd`, and `huggingface_hub` with
+`hf_xet` for the host-side downloads. `build_image.sh` fetches the base engine image
+`dsv41-1017-ds41f:r6w` from Hugging Face when it is missing (see "Base image" below). On a stock Ubuntu 24.04 the documented install needs
 `--break-system-packages` (PEP 668 marks the system python externally managed):
 
 ```bash
+sudo apt-get install -y zstd
 python3 -m pip install --user --break-system-packages -U 'huggingface_hub[hf_xet]'
 ```
 
@@ -51,7 +53,7 @@ python3 -m pip install --user --break-system-packages -U 'huggingface_hub[hf_xet
 ```bash
 export HF_TOKEN=hf_...               # account must have accepted the model terms
 bash scripts/download_and_verify.sh  # hf_xet download at the pinned revision + sha256 verify
-bash scripts/build_image.sh          # base engine image + our layer (see below)
+bash scripts/build_image.sh          # base image (fetched from HF if missing) + our layer, ~10 min
 bash scripts/build_cold_alias.sh     # 8.59 GiB side file, read-only on the pack
 bash scripts/serve.sh                # detached; arms the memory guard
 bash scripts/guard.sh status         # container + endpoint + memory snapshot
@@ -81,6 +83,39 @@ stop` and `bash scripts/serve.sh` again; the second boot runs at the measured sp
 recipe's pins (vllm-exl3, exllamav3, MoE tile K): an older image under the default
 tag serves older shim code and fails at weight load with `no module or parameter
 named 'head'`. Rebuild it with `build_image.sh`.
+
+### Base image
+
+The recipe's layer goes on top of `dsv41-1017-ds41f:r6w`: Christopher Owen's spark-ds41f r6w
+with justincasey's DeepSeek-V4.1-Flash-1017 patches, built by `base/docker/Dockerfile` (see
+`base/README.md`). That build needs no GPU but takes hours, so when the image is missing
+`build_image.sh` runs `scripts/fetch_base.sh`, which:
+
+1. downloads [vcruz305/DSV4.1-Flash-1017-Spark-base-image](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-Spark-base-image)
+   at the revision pinned in `scripts/env.sh` (one 8.8 GB `.tar.zst`) and checks its sha256;
+2. loads it as `dsv41-1017-ds41f:r6w-redist` and checks the digest of its single layer and its
+   label set against the pins in `scripts/env.sh`;
+3. builds `dsv41-1017-ds41f:r6w` from it with `base/Dockerfile.cutlass-dsl`, which installs NVIDIA
+   CUTLASS DSL 4.7.1 from PyPI with `pip --require-hashes` (`base/cutlass-dsl.lock`).
+
+The published image leaves out CUTLASS DSL because its licence allows redistributing only its
+Python source; step 3 gets it from NVIDIA's PyPI release under NVIDIA's terms. The Hugging Face
+repo carries the licences of everything else in the image, including the NVIDIA Deep Learning
+Container License and the CUDA EULA that cover the CUDA libraries.
+
+Measured on the Spark (2026-10-20): the download ran at ~55 MB/s (2.5 min), and `build_image.sh`
+with no base present took 402 s (checksum, load, CUTLASS DSL, our layer). The resulting base has
+the same image config and label set as the base this README was measured on, and the same 202,541
+files: every source file is identical, and 18 differ, all build outputs. Those 18 are vLLM's two
+compiled `_C` extensions, NCCL, TileLang's `libtvm_compiler.so` and an NCCL checksum file (rebuilt
+from the same pinned sources; their compiled binaries are not byte-reproducible), pip records of
+three source-built packages, and apt/ldconfig logs. Served from it, the recipe passed smoke and tool calls
+(streaming and non-streaming) and measured 131.0 ms/step, 4.72 accepted tok/step, 36.0 tok/s on
+`bench/bench7.py` (n=9, 0 engine errors), within the spread of the image on the measured base on
+the same day (129.7 ms/step at 4.60 tok/step, and 127.6 at 5.07).
+
+`BASE_FROM_SOURCE=1 bash scripts/build_image.sh` builds the base from `base/` instead.
+`BASE_KEEP_ARCHIVE=1` keeps the downloaded archive in `$BASE_DL_DIR`.
 
 ## The measured flag set (do not deviate without re-measuring)
 
@@ -584,7 +619,9 @@ from-scratch install without them boots, passes `smoke.sh`, answers
   TileKernels, sparknet. The base image is built by `base/docker/Dockerfile`:
   justincasey's DeepSeek-V4.1-Flash-1017-4x-DGX-Spark recipe at `fa77c26`
   (Apache-2.0, its `LICENSE` and `NOTICE` kept in `base/`), copied unmodified because
-  that repository is no longer online.
+  that repository is no longer online. The prebuilt copy on Hugging Face
+  (`vcruz305/DSV4.1-Flash-1017-Spark-base-image`) carries the licences and NOTICE of every
+  component in the image; NVIDIA CUTLASS DSL is not in it and is installed from PyPI.
 - Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels
   with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
 - Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by
@@ -599,6 +636,8 @@ from-scratch install without them boots, passes `smoke.sh`, answers
 | `scripts/env.sh` | pins (model revision, image, fork/plugin SHAs), paths, serve knobs |
 | `scripts/download_and_verify.sh` | hf_xet download at the pinned revision + sha256 verification |
 | `scripts/build_image.sh` | base engine + forks + shim image build |
+| `scripts/fetch_base.sh` | fetches the prebuilt base from Hugging Face, verifies it, reinstalls CUTLASS DSL |
+| `base/` | the base image's build files (justincasey's, unmodified), `Dockerfile.cutlass-dsl`, `cutlass-dsl.lock` |
 | `docker/Dockerfile` | the layer: vllm-exl3, exllamav3 at tile-K 16, shim, TP1 decode tiles |
 | `docker/tp1_decode_tiles.py` | TP1 decode tile tables for the base image's FP8 TileLang linears |
 | `scripts/build_cold_alias.sh` | builds the cold-expert side file from your own pack copy |

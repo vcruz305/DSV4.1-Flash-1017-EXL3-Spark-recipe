@@ -20,6 +20,17 @@ MODEL_NAME="dsv41-1.62bpw-v3"          # directory name under $MODELS_DIR
 # That Dockerfile's own base is vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf.
 BASE_IMAGE="${BASE_IMAGE:-dsv41-1017-ds41f:r6w}"
 IMAGE="${IMAGE:-dsv41-1017-exl3:r6w}"
+# Prebuilt base: the redistributable copy of $BASE_IMAGE on Hugging Face (CUTLASS DSL removed,
+# reinstalled from PyPI by scripts/fetch_base.sh). Pinned by revision, archive sha256, layer
+# digest and label-set sha256.
+BASE_HF_REPO="${BASE_HF_REPO:-vcruz305/DSV4.1-Flash-1017-Spark-base-image}"
+BASE_HF_REV="${BASE_HF_REV:-17ed433666f4cc6dfa86bcc1d3f4448255fd58fb}"
+BASE_ARCHIVE="dsv41-1017-ds41f-r6w-redist.tar.zst"
+BASE_ARCHIVE_SHA256="97d31344b0e5f8e17bf69e05d679a25b3256a452a7275bc294eb6bd149f58e9a"
+BASE_REDIST_IMAGE="dsv41-1017-ds41f:r6w-redist"
+BASE_REDIST_LAYER="sha256:8d743923e09ad9d435255f9436b5aa1a42d2e88cced04d121b238f8a726990cc"
+BASE_LABELS_SHA256="436ee3f65e6be1cd8f897eeb343c56a9a057a02069eb0d07aaccfcee2b4e73e4"
+BASE_DL_DIR="${BASE_DL_DIR:-$HOME/.cache/dsv41-base-image}"
 
 # Runtime forks baked into the layer above the base, pinned to the commits whose
 # file hashes match the measured server (branches named below).
@@ -61,6 +72,7 @@ ATS_MTP="${ATS_MTP:-1}"
 ATS_EMBED="${ATS_EMBED:-1}"
 
 export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
+export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
 export CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
