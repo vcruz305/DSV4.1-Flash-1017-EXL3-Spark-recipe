@@ -59,6 +59,10 @@ API_PORT="${API_PORT:-8000}"
 # OpenAI model id the server answers to. Change it only to fit a front end that requires its
 # own id (e.g. a model manager); the bench scripts read the same variable.
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv41}"
+# Output cap for requests that send no max_tokens (agent clients such as Hermes send none). Without
+# it a reply that loops runs until the 524288-token window is full. A client value still wins.
+# 0 = no server default.
+DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
 MAXLEN="${MAXLEN:-524288}"      # largest measured clean limit (520K retrieval); 32768 is 1-5 % faster on short prompts
 KVB="${KVB:-1073741824}"        # 1 GiB KV pool (vLLM reports 959,768 tokens at MAXLEN=524288)
 MNBT="${MNBT:-2112}"
@@ -78,5 +82,5 @@ export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
 export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export SERVED_MODEL_NAME CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
+export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
 export ATS_LAYERS ATS_MTP ATS_EMBED

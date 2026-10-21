@@ -21,6 +21,9 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 # Prefix caching (default on) reuses the KV of a repeated prompt prefix (multi-turn chat,
 # agents, follow-up questions on one long document); PREFIX_CACHING=0 turns it off.
 # See README "Prefix caching".
+# Default output cap for requests without max_tokens (0 = none); see DEFAULT_MAX_TOKENS in env.sh.
+GENCFG=()
+[ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && GENCFG=(--override-generation-config "{\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}}")
 PCF=--enable-prefix-caching
 [ "${PREFIX_CACHING:-1}" = "0" ] && PCF=--no-enable-prefix-caching
 
@@ -43,7 +46,7 @@ exec vllm serve "$MODEL_DIR" \
     --max-num-batched-tokens "$MNBT" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --kv-cache-memory-bytes "$KVB" \
-    --generation-config vllm \
+    --generation-config vllm "${GENCFG[@]}" \
     --engram-config '{"table_memory":"disk","disk_resident_scales":false,"projection_tp":true}' \
     --attention-backend tilelang \
     --linear-backend tilelang \
