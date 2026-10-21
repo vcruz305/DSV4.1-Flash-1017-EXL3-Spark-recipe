@@ -33,7 +33,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  jit    : $JIT_HOST -> $JIT (via $CACHE_DIR -> /cache)"
   echo "  port   : $API_PORT"
   echo "  maxlen : $MAXLEN  kv=$KVB  mnbt=$MNBT  lpt=$LPT  mtp_k=$MTP_K"
-  echo "  graphs : $CG_MODE sizes=$CAPTURE_SIZES  gpu_util=$GPU_MEM_UTIL"
+  echo "  graphs : $CG_MODE sizes=$CAPTURE_SIZES  gpu_util=$GPU_MEM_UTIL (inert while KVB is set)"
   echo "  ats    : layers=$ATS_LAYERS mtp=$ATS_MTP embed=$ATS_EMBED"
   echo
   echo "env:"
@@ -54,6 +54,15 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  --max-model-len $MAXLEN --max-num-seqs 1 --max-parallel-prefills 1 \\"
   echo "  --max-num-batched-tokens $MNBT --gpu-memory-utilization $GPU_MEM_UTIL \\"
   echo "  --kv-cache-memory-bytes $KVB --generation-config vllm --attention-backend tilelang \\"
+  gen_json=""
+  [ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && gen_json="${gen_json:+$gen_json,}\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}"
+  [ -n "${DEFAULT_TEMPERATURE:-}" ] && gen_json="${gen_json:+$gen_json,}\"temperature\": ${DEFAULT_TEMPERATURE}"
+  [ -n "${DEFAULT_TOP_P:-}" ] && gen_json="${gen_json:+$gen_json,}\"top_p\": ${DEFAULT_TOP_P}"
+  if [ -n "$gen_json" ]; then
+    echo "  --override-generation-config {$gen_json} \\"
+  else
+    echo "  (no --override-generation-config: DEFAULT_MAX_TOKENS=0 and no sampling defaults) \\"
+  fi
   echo "  --linear-backend tilelang --moe-backend tilelang --jit-monitor-mode warn \\"
   echo "  --compilation-config {\"cudagraph_mode\":\"$CG_MODE\",...,\"cudagraph_capture_sizes\":[$CAPTURE_SIZES]} \\"
   echo "  --speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$MTP_K,...} \\"
@@ -143,6 +152,25 @@ for k in $SYSCTL_KEYS; do
   printf '%s=%s\n' "$k" "$(cat "/proc/sys/${k//.//}")" >>"$RUN/sysctl.before"
 done
 
+# Only `guard.sh stop` restores the host sysctls, and it refuses to run while
+# the serve is meant to be up. If this script aborts after changing them but
+# before the container exists (denied sudo rule, docker run failure, ...), the
+# host was left at the serving policy with nothing running. Restore on abort.
+restore_sysctls_on_abort() {
+  [ -s "${RUN:-}/sysctl.before" ] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      vm.compaction_proactiveness|vm.watermark_boost_factor|vm.swappiness) ;;
+      *) continue ;;
+    esac
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    sudo -n sysctl -q "$k=$v" >/dev/null 2>&1 || true
+  done <"$RUN/sysctl.before"
+  echo "serve.sh aborted before the container was up; restored the host sysctls saved in $RUN/sysctl.before" >&2
+}
+trap restore_sysctls_on_abort EXIT
+
 sudo -n sysctl -q vm.compaction_proactiveness=0 vm.watermark_boost_factor=0 vm.swappiness=0
 # swapoff fails when any page is still swapped in (common on a box that has been
 # up a while). Under `set -e` that aborted the launch *after* the sysctls were
@@ -152,7 +180,10 @@ if ! sudo -n swapoff -a; then
   echo "         guard's swap-growth check will measure from a non-zero base." >&2
 fi
 sudo -n swapon -a 2>/dev/null || true
-sync; sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync
+# `sudo sh -c` needs a sudoers rule for sh itself (on DGX OS sh is dash), which
+# box-hardening sudoers do not grant; `sudo tee` needs only a rule for tee.
+echo 1 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
 sleep 3
 
 BASE_SWAP=$(awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{printf "%d", t-f}' /proc/meminfo)
@@ -179,7 +210,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -v "$HERE/serve_inner.sh":/root/serve.sh:ro \
   -p "$API_PORT":8000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
-  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" -e DEFAULT_MAX_TOKENS="$DEFAULT_MAX_TOKENS" \
+  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" -e DEFAULT_MAX_TOKENS="$DEFAULT_MAX_TOKENS" -e DEFAULT_TEMPERATURE="$DEFAULT_TEMPERATURE" -e DEFAULT_TOP_P="$DEFAULT_TOP_P" \
   -e B12X_AUTOTUNE=0 \
   -e B12X_BIND_COMPILE_WORKERS="${B12X_BIND_COMPILE_WORKERS:-2}" \
   -e B12X_STATE_COMPILE_WORKERS="${B12X_STATE_COMPILE_WORKERS:-2}" \
@@ -239,6 +270,8 @@ sudo -n docker run -d --name "$CONTAINER" \
 
 echo "LAUNCHED $CONTAINER ($(cat "$RUN/container_id.txt"))"
 echo "run dir: $RUN"
+# The container exists: from here only `guard.sh stop` may restore the host.
+trap - EXIT
 
 # ---- stage breadcrumbs -----------------------------------------------------
 # $RUN/stage used to be written once ("preflight") and never updated, so every
@@ -250,6 +283,7 @@ echo "preflight" >"$RUN/stage"
 # The awk program goes in as an argument: a single-quoted program inside the
 # single-quoted bash -c body would end the outer quote and kill the watcher.
 READY_MEM_AWK='/^Cached:/{c=$2} /^MemFree:/{f=$2} END{printf "page cache %.2f GiB, free %.2f GiB\n", c/1048576, f/1048576}'
+CACHE_LOW_AWK="BEGIN{exit !(c < 1.5)}"
 # The two background processes below live as long as the server. They must not inherit
 # the caller's open files: under `flock LOCK bash scripts/serve.sh`, the sudo processes kept
 # the lock's descriptor and the lock stayed held until the server was stopped.
@@ -267,9 +301,22 @@ no_inherited_fds() {
       *"Graph capturing"*)              echo "graph-capture" >"$2/stage" ;;
       *"init engine"*)                  echo "engine-init" >"$2/stage" ;;
       *"Application startup complete"*) echo "ready" >"$2/stage"; : >"$3/.warm"
-        awk "$4" /proc/meminfo >"$2/ready-mem" ;;
+        awk "$4" /proc/meminfo >"$2/ready-mem"
+        # Under ~1.5 GiB of page cache at ready the cold experts are re-read
+        # from NVMe on every step and decode runs ~3x slower for the whole
+        # life of this boot. Leave a warning guard.sh status prints.
+        cache_now=$(cut -d" " -f3 "$2/ready-mem")
+        if awk -v c="$cache_now" "$5"; then
+          { echo "WARNING: only ${cache_now} GiB of page cache at ready (< 1.5 GiB): the cold"
+            echo "         experts will be re-read from NVMe on every step and decode will run"
+            echo "         ~3x slower for the whole life of this boot. Free host memory"
+            echo "         (systemctl isolate multi-user.target, stop heavy services), then"
+            echo "         restart once: bash scripts/guard.sh stop && bash scripts/serve.sh"
+          } >"$2/slow-boot"
+          cat "$2/slow-boot" >&2
+        fi ;;
     esac
-  done' _ "$CONTAINER" "$RUN" "$JIT_HOST" "$READY_MEM_AWK") >/dev/null 2>&1 &
+  done' _ "$CONTAINER" "$RUN" "$JIT_HOST" "$READY_MEM_AWK" "$CACHE_LOW_AWK") >/dev/null 2>&1 &
 echo "stage watcher: pid $!"
 
 # ---- ready-state page-cache split ------------------------------------------
@@ -285,10 +332,18 @@ echo "stage watcher: pid $!"
 # ---- memory guard ---------------------------------------------------------
 (no_inherited_fds sudo -n setsid nohup bash "$HERE/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP") \
   >/dev/null 2>&1 &
-for _ in $(seq 1 100); do grep -q "guard: armed" "$RUN/guard.log" 2>/dev/null && break; sleep 0.1; done
-if ! grep -q "guard: armed" "$RUN/guard.log" 2>/dev/null; then
-  echo "WARNING: the memory guard did not arm (see $RUN/guard.log). The serve is UNGUARDED;" >&2
+# The guard itself waits up to 24 s (480 x 0.05 s) for the container to appear
+# before it arms, so a 10 s wait here raced the real arm and printed a false
+# UNGUARDED warning. Cover its full window.
+GUARD_ARMED=0
+for _ in $(seq 1 300); do
+  grep -q "guard: armed" "$RUN/guard.log" 2>/dev/null && { GUARD_ARMED=1; break; }
+  sleep 0.1
+done
+if [ "$GUARD_ARMED" = 1 ]; then
+  echo "guard armed: MemAvailable floor 0.5 GiB, swap growth <= 64 MiB, 0.05 s"
+else
+  echo "WARNING: the memory guard did not arm within 30 s (see $RUN/guard.log). The serve is UNGUARDED;" >&2
   echo "         stop it with: bash scripts/guard.sh stop" >&2
 fi
-echo "guard armed: MemAvailable floor 0.5 GiB, swap growth <= 64 MiB, 0.05 s"
 echo "watch: bash scripts/guard.sh status   stop: bash scripts/guard.sh stop"

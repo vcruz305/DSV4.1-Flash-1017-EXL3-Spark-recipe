@@ -50,6 +50,13 @@ python3 -m pip install --user --break-system-packages -U 'huggingface_hub[hf_xet
 (`numpy` is only needed for the optional `--select-npz` route-histogram path in
 `tools/ats_build_alias.py`; the shipped `--experts-json` path is stdlib-only.)
 
+`serve.sh` and `guard.sh` run everything through `sudo -n`, so the box's sudoers
+must grant the operator at least: `docker`, `sysctl` (the three `vm.*` keys below),
+`swapoff`/`swapon`, and `tee /proc/sys/vm/drop_caches` (the cache drop is
+`echo 1 | sudo -n tee /proc/sys/vm/drop_caches`; the older
+`sudo sh -c 'echo 1 > ...'` form needs a sudoers rule for `sh` itself, which
+hardened boxes do not grant), plus `pkill` for `guard.sh stop`.
+
 ```bash
 export HF_TOKEN=hf_...               # account must have accepted the model terms
 bash scripts/download_and_verify.sh  # hf_xet download at the pinned revision + sha256 verify
@@ -138,6 +145,7 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 | `--max-model-len 524288` | 512K tokens, the largest limit measured clean on one Spark: needle retrieval at 520K, minimum MemAvailable 2.23 GiB under that prefill, short-prompt decode 147.2 ms/step against 140.5-142.0 at 32K (see Measured long context). The model is rated for 1,048,576 (YaRN x16 over 65,536); 1M does not fit (the prefill transient grows with prompt length) |
 | `--max-num-batched-tokens 2112 --long-prefill-token-threshold 2047` | the aligned-prefill chunk; 8192 does not fit |
 | `--kv-cache-memory-bytes 1073741824` | 1 GiB KV at the engine's `auto` (bf16) cache dtype. The token count vLLM reports depends on `--max-model-len` for this hybrid attention (sliding-window and compressed groups): 236,089 at 32K, 394,892 at 64K, 595,001 at 128K, 760,070 at 229K, 959,768 at 524K (1.83x one full-length request) |
+| `--gpu-memory-utilization 0.90` (`GPU_MEM_UTIL`) | **inert in this recipe**: vLLM ignores `--gpu-memory-utilization` whenever `--kv-cache-memory-bytes` is set, and `serve_inner.sh` always passes the latter — at boot the engine logs `reserved ... for KV Cache as specified by kv_cache_memory_bytes config and skipped memory profiling. This does not respect the gpu_memory_utilization config`. Changing `GPU_MEM_UTIL` changes nothing; change `KVB`. The flag is kept only so the invocation matches the measured one |
 | `--enable-prefix-caching` | default on: a request that repeats a cached prefix (follow-up turns, new questions on the same document) skips its prefill, 518K tokens to first token in 2.5-3.7 s instead of 464 s; no step-time cost measured. `PREFIX_CACHING=0` turns it off (see Prefix caching) |
 | `B12X_AUTOTUNE=0` | the base image's optional per-kernel autotune sweep is hours; prebuilt artifacts are the measured path |
 | `--security-opt seccomp=unconfined --security-opt label=disable --ulimit memlock=-1` | the Engram reader initialises io_uring; a default seccomp profile aborts it |
@@ -146,6 +154,75 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 Host side, while serving: `vm.compaction_proactiveness=0`,
 `vm.watermark_boost_factor=0`, `vm.swappiness=0`, swap reset before boot.
 `scripts/guard.sh stop` restores them.
+
+**Engine of record.** The vLLM tree the server actually runs is the patched tree at
+`/opt/spark3/candidate/vllm` inside the container image — not the stock
+`dist-packages` copy. Before renaming, removing or "cleaning up" any
+`--speculative-config` key, grep that tree
+(`sudo -n docker exec dsv41-tp1 grep -rn <key> /opt/spark3/candidate/vllm/vllm/`):
+for example `adaptive_verification_row_cost` (engine default 0.02; this recipe
+sets 0.01) is a real field of the engine's speculative config
+(`vllm/config/speculative.py`), while `adaptive_verification_cost_scale` does not
+exist there; renaming the key leaves the engine at its default row cost without any error.
+
+## Request defaults
+
+`scripts/env.sh` sets `DEFAULT_MAX_TOKENS=32768`, which `serve_inner.sh` serves
+as `max_new_tokens` inside `--override-generation-config` (together with the sampling
+defaults below). It caps only
+requests that send no `max_tokens` of their own — agent clients such as Hermes
+send none, and without the cap a reply that falls into a repetition loop runs
+until the 524,288-token window is full (observed: one reply generated for over
+an hour at ~48 tok/s until the serve was reloaded). A client-sent `max_tokens`
+always wins over the cap. `DEFAULT_MAX_TOKENS=0` passes no override and
+disables the cap.
+
+### Sampling defaults
+
+The pack ships no `generation_config.json`, so a request that sends no sampling parameters
+would run at vLLM's neutral defaults (temperature 1.0, top_p 1.0). Agent clients such as
+Hermes send neither, which is how every agent chat on this serve ran at temperature 1.0 on a
+1.62 bpw quant whose MTP drafts are greedy. `scripts/env.sh` now sets
+`DEFAULT_TEMPERATURE=0.6` and `DEFAULT_TOP_P=0.95`, served through the same
+`--override-generation-config` as the output cap (vLLM accepts `max_new_tokens`,
+`temperature`, `top_k`, `top_p`, `min_p` and `repetition_penalty` there). A client that sends
+its own value still wins per request; an empty value in `env.sh` ships no default. The greedy
+bench (`bench/bench7.py` sends `temperature 0`) is unaffected.
+
+Measured on the live serve, one request at a time (2026-10-21; raw samples in the campaign
+files, `stability/lanes/{sampling,toolcalls}`):
+
+- **Tool calling**, 12 agent scenarios (8 Hermes-like tools, streaming and non-streaming):
+  valid call (right tool, parseable and complete arguments, no leaked markup) in 25/30 (83 %)
+  at the neutral default, 24/28 (86 %) greedy, 25/28 (89 %) at 0.6 / 0.95. Every failure was a
+  wrong or absent call, never a malformed one. The neutral default spent a mean 906 completion
+  tokens and 46.7 s per call (worst short call 2,907 tokens, 167 s); 0.6 / 0.95 did the same
+  calls in 277 tokens and 12.3 s. Greedy fell into a repetition loop on a 60K-token prompt and
+  ran into both 600 s client timeouts.
+- **Chat replies** (1200-token answers, 3 paired prompts): neutral default 15.7-19.5 tok/s,
+  0.6 / 0.95 17.7-22.5 tok/s, greedy 19.3-34.5 tok/s but with a 27x repetition loop on one of
+  the three prompts (the loop's acceptance is what makes it fast; the same signature as the
+  >1 h runaway reply above). No loop at 0.6 / 0.95 on any measured prompt.
+
+`min_p`, `top_k` and `repetition_penalty` were not measured and are not set. Two scenarios
+failed under every setting and are model behaviour, not serve configuration: a ~60K-token
+pasted-log prompt (2/12 valid calls) and a request to record a checklist (1/12).
+
+## Client timeouts and queueing
+
+The serve runs one request at a time (`--max-num-seqs 1`), so a request that
+arrives while another is running waits in vLLM's queue and can sit there for
+minutes with no bytes sent to the client. Prefill itself is also long: at the
+measured ~1K tok/s a ~400K-token prompt takes ~7 min before the first token.
+Set client timeouts accordingly: an agent client needs a stream-stale/read
+timeout of at least 2400 s for long-context requests (a 900 s timeout was
+observed killing a 424K-token prefill mid-stream). The manager's keep-alive wrapper (port 8889) exists precisely so
+this does not kill legitimate prefills: while a request waits in the queue or
+prefills, the wrapper sends SSE comments and leading-whitespace heartbeat
+chunks, so a proxy or client that cuts an "idle" connection after ~180 s does
+not terminate the request — but a client that treats those bytes as
+first-token data will mis-measure TTFT, and a client connected directly to
+port 8000 gets no keep-alive at all and must rely on its own timeout alone.
 
 ## Measured bring-up (single Spark)
 
@@ -182,6 +259,19 @@ MemAvailable floor, 64 MiB swap-growth allowance, 0.05 s sampling
 The guard runs as root and keeps its files (`stage`, `guard.log`, `sysctl.before`) in the
 run directory, which the container cannot see: it gets only `$RUN/ctr` at `/mem`.
 `guard.sh stop` restores only the three sysctls `serve.sh` changes, and only integer values.
+
+**Host memory at ready is a hard requirement, not a tuning knob.** The boots this
+recipe was measured on came up with 2.6-3.3 GiB MemAvailable and 2.5-3.3 GiB of
+page cache at ready (normal boots 2.97-3.41 GiB of cache). With under ~1.5 GiB of
+page cache at ready, the cold experts are re-read from NVMe on every step and
+decode runs ~3x slower for the whole life of the boot — a third party measured
+395 ms/step at 0.5 GiB free against our ~130 ms/step. `serve.sh` writes the
+ready-state split to `$RUN/ready-mem` and leaves a `slow-boot` warning when the
+page cache at ready is under 1.5 GiB; `scripts/guard.sh status` prints both.
+The fix is to free host memory first — `systemctl isolate multi-user.target` and
+stopping heavy services — and then restart the serve once (`scripts/guard.sh
+stop`, then `scripts/serve.sh`). Restarting without freeing memory does not
+help: the condition does not decay on its own (see "Keep the disk quiet").
 
 ## Measured speed
 
@@ -408,8 +498,9 @@ The condition is set by the load and does not decay: 230.1, then 203.9 at +10 mi
 `build_cold_alias.sh`, start the server, stop it (`scripts/guard.sh stop`) and start it
 again before you measure or rely on it; waiting on a slow boot does not help, and
 `drop_caches`/`compact_memory` before the boot do not either. `serve.sh` writes the
-ready-state split to `$RUN/ready-mem`, and `scripts/guard.sh status` prints it and warns
-when the cache is under 1.5 GiB (normal boots 2.97-3.41 GiB, slow ones 0.40-0.81). Earlier,
+ready-state split to `$RUN/ready-mem` and a `slow-boot` warning file when the
+cache at ready is under 1.5 GiB, and `scripts/guard.sh status` prints both and warns
+(normal boots 2.97-3.41 GiB, slow ones 0.40-0.81). Earlier,
 less instrumented runs agree: 358.6 ms/step after a build, 214.3 with `drop_caches` +
 `compact_memory`, 190 -> 228 on one slow boot re-benched after 10 minutes, and 137-140 after
 a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s prefill for

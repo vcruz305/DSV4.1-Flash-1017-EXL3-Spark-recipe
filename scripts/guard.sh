@@ -29,7 +29,10 @@ snapshot() {
   echo "date: $(date -Is)"
   echo "container: $(sudo -n docker ps -a --filter "name=$CONTAINER" --format '{{.Status}}' | head -1)"
   echo "endpoint: $(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${API_PORT}/v1/models" 2>/dev/null)"
-  awk '/MemAvailable/{printf "mem_available_gib: %.2f\n", $2/1048576} /SwapTotal{t=$2} /SwapFree{f=$2} END{printf "swap_used_kib: %d\n", t-f}' /proc/meminfo
+  # The swap patterns below must stay separate regexes: written as one
+  # /SwapTotal{...} /SwapFree{...} pattern (as this line once was), the regex
+  # matches nothing, t and f stay unset and status always printed 0.
+  awk '/^MemAvailable:/{printf "mem_available_gib: %.2f\n", $2/1048576} /^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{printf "swap_used_kib: %d\n", t-f}' /proc/meminfo
   echo "guard procs: $(pgrep -fc "[g]uard.sh watch" || true)"
   # Page-cache split when the server reported ready (written by serve.sh's stage
   # watcher). Measured: normal boots 2.97-3.41 GiB of cache, slow boots 0.40-0.81.
@@ -40,8 +43,15 @@ snapshot() {
     cache_gib=$(echo "$rm_line" | awk '{print $3}')
     if awk -v c="$cache_gib" 'BEGIN{exit !(c < 1.5)}'; then
       echo "WARNING: this boot came up with little page cache; it will likely decode 1.5-3x slow" >&2
-      echo "         for its whole life. Restart once: bash scripts/guard.sh stop && bash scripts/serve.sh" >&2
+      echo "         for its whole life. Free host memory first (systemctl isolate multi-user.target," >&2
+      echo "         stop heavy services), then restart once: bash scripts/guard.sh stop && bash scripts/serve.sh" >&2
     fi
+  fi
+  # serve.sh's stage watcher drops this file in $RUN at ready when the page
+  # cache is under 1.5 GiB; print it so a status check cannot miss it.
+  if [ -n "$run" ] && [ -f "$run/slow-boot" ]; then
+    echo "SLOW-BOOT WARNING (written at ready):"
+    cat "$run/slow-boot"
   fi
   echo "log_tail:"
   sudo -n docker logs --tail 4 "$CONTAINER" 2>&1 | cut -c1-160
