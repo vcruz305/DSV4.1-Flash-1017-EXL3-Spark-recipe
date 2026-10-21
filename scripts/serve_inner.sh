@@ -22,8 +22,16 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 # agents, follow-up questions on one long document); PREFIX_CACHING=0 turns it off.
 # See README "Prefix caching".
 # Default output cap for requests without max_tokens (0 = none); see DEFAULT_MAX_TOKENS in env.sh.
+# Default sampling for requests without temperature/top_p (empty = none); see DEFAULT_TEMPERATURE /
+# DEFAULT_TOP_P there. vLLM's get_diff_sampling_param accepts exactly max_new_tokens, temperature,
+# top_k, top_p, min_p and repetition_penalty as --override-generation-config defaults, and a client
+# that sends its own value still wins per request.
 GENCFG=()
-[ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && GENCFG=(--override-generation-config "{\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}}")
+gen_json=""
+[ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && gen_json="${gen_json:+$gen_json,}\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}"
+[ -n "${DEFAULT_TEMPERATURE:-}" ] && gen_json="${gen_json:+$gen_json,}\"temperature\": ${DEFAULT_TEMPERATURE}"
+[ -n "${DEFAULT_TOP_P:-}" ] && gen_json="${gen_json:+$gen_json,}\"top_p\": ${DEFAULT_TOP_P}"
+[ -n "$gen_json" ] && GENCFG=(--override-generation-config "{$gen_json}")
 PCF=--enable-prefix-caching
 [ "${PREFIX_CACHING:-1}" = "0" ] && PCF=--no-enable-prefix-caching
 

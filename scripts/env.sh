@@ -63,6 +63,14 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv41}"
 # it a reply that loops runs until the 524288-token window is full. A client value still wins.
 # 0 = no server default.
 DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
+# Default sampling for requests that send no temperature/top_p. Agent clients (Hermes among them)
+# send neither, so without this they ran at vLLM's neutral temperature 1.0 / top_p 1.0, which on this
+# 1.62 bpw quant behind greedy MTP drafts meant repetition loops, a ~3x longer reply per tool call
+# (906 vs 277 completion tokens, 46.7 vs 12.3 s) and 83 % vs 89 % valid tool calls (README "Request
+# defaults"). 0.6 / 0.95 measured best; 0.95 is the model card's top_p. A client value still wins.
+# Empty = no default.
+DEFAULT_TEMPERATURE="${DEFAULT_TEMPERATURE:-0.6}"
+DEFAULT_TOP_P="${DEFAULT_TOP_P:-0.95}"
 MAXLEN="${MAXLEN:-524288}"      # largest measured clean limit (520K retrieval); 32768 is 1-5 % faster on short prompts
 KVB="${KVB:-1073741824}"        # 1 GiB KV pool (vLLM reports 959,768 tokens at MAXLEN=524288)
 MNBT="${MNBT:-2112}"
@@ -70,6 +78,12 @@ LPT="${LPT:-2047}"
 MTP_K="${MTP_K:-5}"
 CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
+# INERT in this recipe: vLLM ignores --gpu-memory-utilization whenever
+# --kv-cache-memory-bytes (KVB below) is set, and serve_inner.sh always passes
+# KVB. At boot the engine logs "reserved ... for KV Cache as specified by
+# kv_cache_memory_bytes config and skipped memory profiling. This does not
+# respect the gpu_memory_utilization config". Changing GPU_MEM_UTIL changes
+# nothing; change KVB. Kept only so the invocation matches the measured one.
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 PREFIX_CACHING="${PREFIX_CACHING:-1}"   # 1 = reuse KV of repeated prefixes (default); 0 = every request is a full prefill
 DSML_STOP="${DSML_STOP:-1}"             # 1 = end tool-call replies at the first closing tag after a DSML invoke
@@ -82,5 +96,5 @@ export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
 export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
+export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
 export ATS_LAYERS ATS_MTP ATS_EMBED
