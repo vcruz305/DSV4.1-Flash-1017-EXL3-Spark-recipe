@@ -42,6 +42,13 @@ Adds the stop string ``</|DSML| invoke>\n</`` (kept in the output) to chat
 requests that carry tools, so a reply ends at the first closing tag after a
 closed invoke.  See ``_install_dsml_stop``.
 
+Repetition stop (``DSV41_REP_STOP=MIN:MAX:COUNT``, on by default as ``64:512:8``)
+-------------------------------------------------------------------------------
+Gives every request that does not set ``repetition_detection`` itself a
+server-side default, so a reply whose reasoning falls into a loop ends with
+``finish_reason="repetition"`` instead of running to ``max_tokens``.
+See ``_install_repetition_stop``.
+
 DSML parameter repair (``DSV41_DSML_PARAM_REPAIR=1``, on by default)
 --------------------------------------------------------------------
 Issue #15 form (b): when the model leaves out a parameter's closer and writes
@@ -337,6 +344,46 @@ def _install_rope_trim() -> None:
 
     load_model._dsv41_rope_trim = True
     DefaultModelLoader.load_model = load_model
+
+
+def _install_repetition_stop() -> None:
+    """Default ``repetition_detection`` for requests that do not set it.
+
+    In long agentic turns (Hermes, a multi-file build task) the reasoning can fall
+    into an exact loop and run to the 32,768-token cap: 15 min of decode with no
+    tool call, after which the client drops the reply. vLLM can stop such a reply
+    (``RepetitionDetectionParams``: the last ``COUNT`` blocks of ``L`` tokens are
+    identical, for some ``L`` in ``MIN..MAX``) but only when the request asks.
+    ``MIN`` stays at 64: a shorter loop is also a loop of a longer period, while a
+    short period would end legit output such as a literal grid of identical rows.
+    ``COUNT=8`` means at least 512 tokens of exact repetition. The check is cheap:
+    for each ``L`` it stops at the first token that differs.
+    """
+    raw = os.environ.get("DSV41_REP_STOP", "64:512:8").strip()
+    if raw in ("0", "", "false", "off"):
+        return
+    from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
+
+    try:
+        lo, hi, count = (int(x) for x in raw.split(":"))
+        RepetitionDetectionParams(max_pattern_size=hi, min_pattern_size=lo, min_count=count)
+    except Exception as exc:
+        print(f"DSV41_REP_STOP={raw!r} ignored (want MIN:MAX:COUNT): {exc!r}", flush=True)
+        return
+    orig = SamplingParams.update_from_tokenizer
+    if getattr(orig, "_dsv41_rep_stop", False):
+        return
+
+    def update_from_tokenizer(self, tokenizer):
+        orig(self, tokenizer)
+        if self.repetition_detection is None:
+            self.repetition_detection = RepetitionDetectionParams(
+                max_pattern_size=hi, min_pattern_size=lo, min_count=count
+            )
+
+    update_from_tokenizer._dsv41_rep_stop = True
+    update_from_tokenizer._dsv41_caps = getattr(orig, "_dsv41_caps", False)
+    SamplingParams.update_from_tokenizer = update_from_tokenizer
 
 
 def _install_sampling_caps() -> None:
@@ -1046,6 +1093,7 @@ def register() -> None:
     _install_dsml_stop()
     _install_dsml_param_repair()
     _install_sampling_caps()
+    _install_repetition_stop()
 
     if getattr(register, "_installed", False):
         return

@@ -208,6 +208,28 @@ files, `stability/lanes/{sampling,toolcalls}`):
 failed under every setting and are model behaviour, not serve configuration: a ~60K-token
 pasted-log prompt (2/12 valid calls) and a request to record a checklist (1/12).
 
+### Repetition stop
+
+The output cap and 0.6 / 0.95 bound a runaway reply but don't end it: in long agentic turns
+(a multi-step Hermes build task) the reasoning still fell into an exact loop and ran ~30K
+tokens, 15 min, with no tool call, until the client cut it. vLLM can end such a reply
+(`RepetitionDetectionParams`: the last `COUNT` blocks of `L` tokens are identical, for some
+`L` in `MIN..MAX`), but only when the request asks for it, and agent clients don't. The shim
+gives every request that doesn't set `repetition_detection` itself the default
+`REP_STOP=64:512:8` (`scripts/env.sh`; `REP_STOP=0` turns it off): a reply ends with
+`finish_reason="repetition"` after at least 512 tokens of exact repetition. `MIN=64` keeps
+short legitimate repeats (a grid of identical rows) alive; a short loop is also a loop of a
+longer period, so it is still caught.
+
+Measured on the live serve (temperature 0):
+- "Write this sentence 400 times": stopped at 1,417 tokens (`repetition`), vs 12,000 tokens
+  (`length`, 300 s) when the request opts out with `min_count: 0`.
+- The same request for 15 lines (397 tokens) finished normally (`stop`).
+- A short Hermes tool-using task (write a module and its tests, run pytest) completed with
+  no repetition stop. Synthetic check cost: ~0.08 ms per step.
+- Quality with the stop on: GSM8K first 100 problems 99/100, HumanEval first 40 problems
+  40/40, no answer cut short.
+
 ## Client timeouts and queueing
 
 The serve runs one request at a time (`--max-num-seqs 1`), so a request that
