@@ -1,11 +1,11 @@
 #!/bin/bash
 # Host wrapper: launch the serving container on ONE DGX Spark. Detached.
 #
-#   bash scripts/serve.sh              # measured configuration
-#   DRY_RUN=1 bash scripts/serve.sh    # print the docker command, run nothing
+#   bash packs/1.55bpw-rexl3/scripts/serve.sh  # measured configuration
+#   DRY_RUN=1 bash packs/1.55bpw-rexl3/scripts/serve.sh    # print the docker command, run nothing
 #
 # Requires passwordless docker (sudo -n), the pack downloaded and verified, and
-# the alias side file built (scripts/build_cold_alias.sh).
+# the alias side file built (packs/1.62bpw/scripts/build_cold_alias.sh).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,7 +118,7 @@ fi
 # record before every boot; rebuilds the side file only when that clearly cuts cold routes
 REC_FILE="$HEAT_HOST/route-heat-$MODEL_NAME.npz"
 if [ "$DRY_RUN" != "1" ] && [ "${AUTO_COLD:-${DYN_RESIDENCY:-0}}" = 1 ] && [ -f "$ALIAS_DIR/manifest.json" ]; then
-  python3 "$RECIPE_HOME/tools/auto_cold.py" --alias-dir "$ALIAS_DIR" --model-dir "$MODEL_DIR" --record "$REC_FILE" \
+  python3 "$HERE/../tools/auto_cold.py" --alias-dir "$ALIAS_DIR" --model-dir "$MODEL_DIR" --record "$REC_FILE" \
     || echo "auto_cold failed; serving the current side file" >&2
   [ -f "$ALIAS_DIR/selection.json" ] && COLD_SELECTION="$ALIAS_DIR/selection.json"
 fi
@@ -137,7 +137,7 @@ PY
 then
   echo "alias side file $ALIAS_DIR was built from a different expert selection than" >&2
   echo "configs/cold-alias-selection.json (an earlier recipe version?). Rebuild it:" >&2
-  echo "  bash scripts/build_cold_alias.sh        (~10-20 s, rewrites it in place)" >&2
+  echo "  bash packs/1.62bpw/scripts/build_cold_alias.sh  (~10-20 s, rewrites it in place)" >&2
   if [ "${ALLOW_ALIAS_MISMATCH:-0}" != "1" ]; then
     echo "(ALLOW_ALIAS_MISMATCH=1 serves it anyway)" >&2
     exit 1
@@ -219,12 +219,12 @@ TVM_ENV=()
 [ -n "${TVM_BIND_THREADS:-}" ] && TVM_ENV+=(-e "TVM_BIND_THREADS=$TVM_BIND_THREADS")
 
 # PACK_FILTER=1: load only the tensors model.safetensors.index.json lists, for re-laid
-# (align_safetensors.py) or hard-link overlay packs (scripts/py/sitecustomize.py).
+# (align_safetensors.py) or hard-link overlay packs (packs/1.55bpw-rexl3/scripts/py/sitecustomize.py).
 PACK_ENV=()
 [ "${PACK_FILTER:-0}" = 1 ] && PACK_ENV+=(-v "$HERE/py":/recipe-py:ro -v "$HERE/py/zz_recipe_hooks.pth":/usr/local/lib/python3.12/dist-packages/zz_recipe_hooks.pth:ro -e RECIPE_PY=/recipe-py)
-# ROUTE_STATS=1: per-layer route histogram for tools/plan_reserve.py (dump: touch $RUN/ctr/route-stats/dump.now)
+# ROUTE_STATS=1: per-layer route histogram for packs/1.55bpw-rexl3/tools/plan_reserve.py (dump: touch $RUN/ctr/route-stats/dump.now)
 [ "${ROUTE_STATS:-0}" = 1 ] && PACK_ENV+=(-e VLLM_EXL3_ROUTE_STATS=1 -e VLLM_EXL3_ROUTE_STATS_DIR=/mem/route-stats)
-# DYN_RESIDENCY=1: swap hot cold experts into CUDA slots at runtime (scripts/py/dyn_residency.py; needs ROUTE_STATS=1)
+# DYN_RESIDENCY=1: swap hot cold experts into CUDA slots at runtime (packs/1.55bpw-rexl3/scripts/py/dyn_residency.py; needs ROUTE_STATS=1)
 if [ "${DYN_RESIDENCY:-0}" = 1 ]; then
   [ "${ROUTE_STATS:-0}" = 1 ] || { echo "DYN_RESIDENCY=1 needs ROUTE_STATS=1" >&2; exit 1; }
   [ "${PACK_FILTER:-0}" = 1 ] || PACK_ENV+=(-v "$HERE/py":/recipe-py:ro -v "$HERE/py/zz_recipe_hooks.pth":/usr/local/lib/python3.12/dist-packages/zz_recipe_hooks.pth:ro -e RECIPE_PY=/recipe-py)
@@ -330,7 +330,7 @@ echo "preflight" >"$RUN/stage"
 READY_MEM_AWK='/^Cached:/{c=$2} /^MemFree:/{f=$2} END{printf "page cache %.2f GiB, free %.2f GiB\n", c/1048576, f/1048576}'
 CACHE_LOW_AWK="BEGIN{exit !(c < 1.5)}"
 # The two background processes below live as long as the server. They must not inherit
-# the caller's open files: under `flock LOCK bash scripts/serve.sh`, the sudo processes kept
+# the caller's open files: under `flock LOCK bash packs/1.55bpw-rexl3/scripts/serve.sh`, the sudo processes kept
 # the lock's descriptor and the lock stayed held until the server was stopped.
 no_inherited_fds() {
   local fd
@@ -356,7 +356,7 @@ no_inherited_fds() {
             echo "         experts will be re-read from NVMe on every step and decode will run"
             echo "         ~3x slower for the whole life of this boot. Free host memory"
             echo "         (systemctl isolate multi-user.target, stop heavy services), then"
-            echo "         restart once: bash scripts/guard.sh stop && bash scripts/serve.sh"
+            echo "         restart once: bash scripts/guard.sh stop && bash packs/1.55bpw-rexl3/scripts/serve.sh"
           } >"$2/slow-boot"
           cat "$2/slow-boot" >&2
         fi ;;
@@ -375,7 +375,7 @@ echo "stage watcher: pid $!"
 # $RUN/ready-mem when the server reports ready (see "Keep the disk quiet").
 
 # ---- memory guard ---------------------------------------------------------
-(no_inherited_fds sudo -n setsid nohup bash "$HERE/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP") \
+(no_inherited_fds sudo -n setsid nohup bash "$RECIPE_HOME/scripts/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP") \
   >/dev/null 2>&1 &
 # The guard itself waits up to 24 s (480 x 0.05 s) for the container to appear
 # before it arms, so a 10 s wait here raced the real arm and printed a false

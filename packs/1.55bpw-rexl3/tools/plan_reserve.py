@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Size the cold-expert alias from the memory you want left free (RESERVE_GIB).
 
-    python3 tools/plan_reserve.py --reserve-gib 12 [--npz route_stats.npz] [--build]
+    python3 packs/1.55bpw-rexl3/tools/plan_reserve.py --reserve-gib 12 [--npz route_stats.npz] [--build]
 
 Before a boot it reads MemAvailable and predicts MemAvailable at ready from a
-measured boot of the same pack (configs/reserve-calibration.json):
+measured boot of the same pack (packs/1.55bpw-rexl3/configs/reserve-calibration.json):
 
     ready  = avail_now - (cal.preload_avail - cal.ready_min) - (KVB - cal.kvb)
     cold   = cal.cold_gib + max(0, reserve - ready)
@@ -33,6 +33,8 @@ import sys
 GIB = 2**30
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.dirname(HERE)
+ROOT = os.path.dirname(os.path.dirname(HOME))  # repo root: ats_build_alias.py and the
+# shipped cold-alias membership are shared with the 1.62 pack and live there
 
 
 def mem_available_gib() -> float:
@@ -136,19 +138,19 @@ def main() -> int:
     if not a.out or not a.model_dir:
         print("--build needs --out/ALIAS_DIR and --model-dir/MODEL_DIR", file=sys.stderr)
         return 1
-    cmd = [sys.executable, os.path.join(HERE, "ats_build_alias.py"), "--model-dir", a.model_dir,
+    cmd = [sys.executable, os.path.join(ROOT, "tools", "ats_build_alias.py"), "--model-dir", a.model_dir,
            "--out", a.out, "--embed", "--align", "64"]
     if deficit > 0:
         cmd += ["--select-npz", a.npz, "--budget-gib", f"{cold:.4f}"]
     else:
-        cmd += ["--experts-json", os.path.join(HOME, "configs", "cold-alias-selection.json")]
+        cmd += ["--experts-json", os.path.join(ROOT, "configs", "cold-alias-selection.json")]
     subprocess.run(cmd, check=True)
     man = json.load(open(os.path.join(a.out, "manifest.json")))
     with open(os.path.join(a.out, "selection.json"), "w") as f:
         json.dump(man["experts"], f)
     with open(os.path.join(a.out, "plan.json"), "w") as f:
         json.dump(plan, f, indent=1)
-    print(f"serve with: ALIAS_DIR={a.out} COLD_SELECTION={a.out}/selection.json bash scripts/serve.sh")
+    print(f"serve with: ALIAS_DIR={a.out} COLD_SELECTION={a.out}/selection.json bash packs/1.55bpw-rexl3/scripts/serve.sh")
     return 0
 
 

@@ -1,60 +1,36 @@
-# DSV4.1-Flash-1017 on one DGX Spark: REXL3 1.55 bpw on vLLM, SSD cold experts, traffic-driven residency
+# DSV4.1-Flash-1017-EXL3-Spark-recipe: the 1.62 bpw pack
 
-Serves **DeepSeek-V4.1-Flash-1017** on a single NVIDIA DGX Spark (GB10, 128 GB unified
-memory) with vLLM, using vcruz305's **SAGE REXL3 1.55 bpw** pack. That pack is not
-natively loadable by vLLM; this project makes it serve and keeps it fast while other programs
-(an agent, its tools) share the box. Every number below was measured on that deployment.
+Serving recipe for **vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw** on a single
+NVIDIA DGX Spark (GB10, 128 GB unified memory), using vLLM. Every number below
+was measured on that exact deployment; the flag set in this pack's `scripts/`
+folder is the one that produced them.
 
-What this project adds:
-- **REXL3 1.55 bpw on vLLM**: the EXL3 head is dequantized to BF16 and the EXL3 non-routed
-  linears transcoded to the block-32 FP8 the model's vLLM path expects, in a hard-link overlay
-  of the pack (`scripts/build_rexl3_overlay.sh`, `tools/rexl3_*.py`). Quality through the served
-  API: HumanEval 158/164 (96.3 %), GSM8K 194/200 (97.0 %).
-- **Memory reserve for other tenants**: `RESERVE_GIB` sizes the cold-expert set so the rest of
-  the box keeps that much RAM; a cgroup (`scripts/tenant_scope.sh`) caps those tenants.
-- **Cold set picked from real traffic**: a permanent, fixed-size (~146 KB) per-expert route
-  record, saved across restarts; every boot re-picks the SSD cold set from it when that cuts
-  the expected SSD bytes read per step by more than 5 %. On held-out agent (Hermes) requests
-  this took decode from 4.6 to 16.4 tok/s with the reserve in use (README "Experimental").
-- **Benchmarks and evals** for this box: `bench/` (HumanEval, GSM8K, long context up to 128K,
-  parallel requests), and `touch <record dir>/pause` so they do not pollute the record.
+This repository carries two packs of DeepSeek-V4.1-Flash-1017 over one shared
+engine image. This folder is the 1.62 bpw SAGE EXL3 pack, the recipe this
+repository originally was. The repository root README describes the shared
+engine and both packs; the 1.55 bpw SAGE REXL3 pack (served through vLLM by
+AgentSparko's overlay path) lives in `packs/1.55bpw-rexl3/`.
 
-Built on [vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe)
-(Victor Cruz): the derived vLLM image, the measured flag set, the cold-expert alias loader, the
-memory guard and his own 1.62 bpw pack. That serve path is kept and still works unchanged
-(`MODEL_NAME` default); see "Credits and license".
+**Model (Hugging Face):** <https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw>
+(public, gated: accept the terms once, then use a token).
 
-**Models (Hugging Face):** SAGE REXL3 1.55 bpw and SAGE EXL3 1.62 bpw by
-[vcruz305](https://huggingface.co/vcruz305) (gated: accept the terms once, then use a token).
 Base model: <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017>
 
-Both packs hold SAGE MixedK EXL3 routed experts, EXL3 MTP draft experts and the Engram n-gram
-tables; the Engram tables are streamed from NVMe. Neither pack fits fully resident under vLLM on
-one Spark, so both are served with a **cold-expert alias side file**: the least-routed experts
-(plus the embedding) are gathered into one 64-byte-aligned file the GPU reads through a
-read-only mapping, and every hot expert stays resident.
+The pack holds SAGE MixedK EXL3 routed experts (mixed K1-K4 per projection,
+1.62 bpw), EXL3 MTP draft experts, an EXL3 K8 output head, native block-32 FP8
+for every other linear, and the Engram n-gram tables. The Engram tables are
+streamed from NVMe; everything else is meant to be device-resident. Under vLLM
+on one Spark that does not quite fit, so this recipe serves it with a
+**cold-expert alias side file**: the 1,418 least-routed experts plus the
+embedding are gathered into one 64-byte-aligned file that the GPU reads through
+a read-only mapping, which leaves every hot expert resident with ~4 GiB to spare
+at `--max-model-len 32768` and 3.1-3.2 GiB at the shipped default of 524,288.
 
 ## Status
 
-| Deployment | Model | Engine | Status |
-|---|---|---|---|
-| 1x Spark, TP1 | SAGE **REXL3 1.55 bpw** (overlay, `MODEL_NAME=rexl3-vic-overlay`) | spark-ds41f r6w + vllm-exl3 + exllamav3 (tile-K 16) + shim, DSpark k=5 | **Measured, serving here** |
-| 1x Spark, TP1 | SAGE EXL3 1.62 bpw (default `MODEL_NAME`) | same image | Measured (Vic's recipe numbers) |
-
-### REXL3 1.55 bpw quick start
-
-After the image is built (Quick start below) and the REXL3 pack is downloaded to
-`$MODELS_DIR/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw`:
-
-```bash
-bash scripts/build_rexl3_overlay.sh          # hard-link overlay + BF16 head + FP8 non-routed (GPU free)
-MODEL_NAME=rexl3-vic-overlay HF_OVERRIDES_JSON="$(python3 tools/rexl3_overrides.py)" \
-  RESERVE_GIB=12 ROUTE_STATS=1 DYN_RESIDENCY=1 DYN_RESIDENCY_MAX_SWAPS=0 bash scripts/serve.sh
-bash scripts/smoke.sh                        # must contain "Paris"
-```
-
-The FP8 re-quantization of the non-routed linears is lossy on top of EXL3 (error printed per
-tensor); the quality numbers above are for this overlay.
+| Deployment | Folder | Model | Engine | Status |
+|---|---|---|---|---|
+| 1x Spark, TP1 | `packs/1.62bpw/scripts/` | vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw | spark-ds41f r6w + vllm-exl3 + exllamav3 (tile-K 16, warp-private MoE stages) + shim, DSpark k=5 | **Measured, serving** |
 
 ## Quick start (one Spark)
 
@@ -89,16 +65,16 @@ hardened boxes do not grant), plus `pkill` for `guard.sh stop`.
 
 ```bash
 export HF_TOKEN=hf_...               # account must have accepted the model terms
-bash scripts/download_and_verify.sh  # hf_xet download at the pinned revision + sha256 verify
+bash packs/1.62bpw/scripts/download_and_verify.sh  # hf_xet download at the pinned revision + sha256 verify
 bash scripts/build_image.sh          # base image (fetched from HF if missing) + our layer, ~10 min
-bash scripts/build_cold_alias.sh     # 8.59 GiB side file, read-only on the pack
-bash scripts/serve.sh                # detached; arms the memory guard
+bash packs/1.62bpw/scripts/build_cold_alias.sh     # 8.59 GiB side file, read-only on the pack
+bash packs/1.62bpw/scripts/serve.sh  # detached; arms the memory guard
 bash scripts/guard.sh status         # container + endpoint + memory snapshot
 bash scripts/smoke.sh                # plain completion, must contain "Paris"
 ```
 
 The API is OpenAI-compatible at `http://<host>:8000/v1`, model id `dsv41`.
-`DRY_RUN=1 bash scripts/serve.sh` prints the full launch configuration without
+`DRY_RUN=1 bash packs/1.62bpw/scripts/serve.sh` prints the full launch configuration without
 touching the box.
 
 If `$ALIAS_DIR` already holds a side file from an earlier version of this recipe,
@@ -111,7 +87,7 @@ selection (`ALLOW_ALIAS_MISMATCH=1` overrides).
 
 The first boot after the steps above can run 1.5-3x slow for its whole life (an image
 build just before it leaves the cold working set out of the page cache). Once it is ready, run `bash scripts/guard.sh
-stop` and `bash scripts/serve.sh` again; the second boot runs at the measured speed (see
+stop` and `bash packs/1.62bpw/scripts/serve.sh` again; the second boot runs at the measured speed (see
 "Keep the disk quiet").
 
 `build_image.sh` and `serve.sh` share one image tag (`IMAGE`, default
@@ -238,6 +214,28 @@ files, `stability/lanes/{sampling,toolcalls}`):
 failed under every setting and are model behaviour, not serve configuration: a ~60K-token
 pasted-log prompt (2/12 valid calls) and a request to record a checklist (1/12).
 
+### Repetition stop
+
+The output cap and 0.6 / 0.95 bound a runaway reply but don't end it: in long agentic turns
+(a multi-step Hermes build task) the reasoning still fell into an exact loop and ran ~30K
+tokens, 15 min, with no tool call, until the client cut it. vLLM can end such a reply
+(`RepetitionDetectionParams`: the last `COUNT` blocks of `L` tokens are identical, for some
+`L` in `MIN..MAX`), but only when the request asks for it, and agent clients don't. The shim
+gives every request that doesn't set `repetition_detection` itself the default
+`REP_STOP=64:512:8` (`scripts/env.sh`; `REP_STOP=0` turns it off): a reply ends with
+`finish_reason="repetition"` after at least 512 tokens of exact repetition. `MIN=64` keeps
+short legitimate repeats (a grid of identical rows) alive; a short loop is also a loop of a
+longer period, so it is still caught.
+
+Measured on the live serve (temperature 0):
+- "Write this sentence 400 times": stopped at 1,417 tokens (`repetition`), vs 12,000 tokens
+  (`length`, 300 s) when the request opts out with `min_count: 0`.
+- The same request for 15 lines (397 tokens) finished normally (`stop`).
+- A short Hermes tool-using task (write a module and its tests, run pytest) completed with
+  no repetition stop. Synthetic check cost: ~0.08 ms per step.
+- Quality with the stop on: GSM8K first 100 problems 99/100, HumanEval first 40 problems
+  40/40, no answer cut short.
+
 ## Client timeouts and queueing
 
 The serve runs one request at a time (`--max-num-seqs 1`), so a request that
@@ -300,7 +298,7 @@ ready-state split to `$RUN/ready-mem` and leaves a `slow-boot` warning when the
 page cache at ready is under 1.5 GiB; `scripts/guard.sh status` prints both.
 The fix is to free host memory first — `systemctl isolate multi-user.target` and
 stopping heavy services — and then restart the serve once (`scripts/guard.sh
-stop`, then `scripts/serve.sh`). Restarting without freeing memory does not
+stop`, then `packs/1.62bpw/scripts/serve.sh`). Restarting without freeing memory does not
 help: the condition does not decay on its own (see "Keep the disk quiet").
 
 ## Measured speed
@@ -364,31 +362,6 @@ bytes in flight to saturate DRAM and is not short of warps (two CTAs per SM meas
 12 % slower); what limits it is a fixed dependent chain per K-slice. The W2 kernel
 took the CTA-wide barriers out of that chain; what is left is exposed latency on the
 weight reads. Details in `docs/ENGINEERING_NOTES.md`.
-
-### Parallel requests (`MAX_NUM_SEQS`)
-
-The default serves one request at a time (`MAX_NUM_SEQS=1`); others queue. Raising it does not
-add throughput here: every extra sequence routes to its own experts, so a step reads more
-weight bytes (and more cold experts from the SSD) and each request slows down about in
-proportion. `bench/conc_decode.py`, 256 tokens per request, Hermes-traffic cold set:
-
-| `MAX_NUM_SEQS` | requests at once | total tok/s | per request decode tok/s |
-| --- | --- | --- | --- |
-| 1 | 1 | 27.7 | 35.4 |
-| 1 | 2 (queued) | 15.3 | 12.9 / 22.2 (2nd waits 13.7 s) |
-| 2 | 2 | 20.8–21.1 | 10.7–10.9 / 14.4–16.1 |
-| 4 | 1 | 30.5 | 39.8 |
-| 4 | 4 | 28.1 | 7.2 / 9.1 / 10.2 / 8.4 |
-
-Single-request speed and bench7 are unchanged by the setting (prose 35.2, code 29.5–30.3 tok/s
-median); the lowest MemAvailable seen was 12.4–12.8 GiB. So `MAX_NUM_SEQS=4` only helps when
-several short requests should all start at once (time to first token ~1 s each instead of
-waiting in line); total throughput stays ~28 tok/s.
-
-Decision: `MAX_NUM_SEQS=1` stays the default. The decode step here is bound by weight reads, and
-4 sequences route to ~4x the distinct experts, so a step costs nearly 4x and total throughput
-stays flat. The cold set needs no concurrency term: the record counts every routed token of every
-sequence, which is what a batched step reads.
 
 ## Measured prefill
 
@@ -583,12 +556,7 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   the MoE reduce reorder sums. Two runs of the same prompt can differ in the
   tail. Do not build exact-match tests on it; compare logprobs.
 - Pack-level quality figures are on the model card. This recipe did not re-run
-  them. Measured here through the served API on the REXL3 overlay: **HumanEval
-  158/164 = 96.3 % pass@1** (greedy, thinking off; `bench/humaneval_api.py`, which runs
-  the tests in a network-less container; 1156 s at `--max-num-seqs 1`). **GSM8K 194/200 = 97.0 %**
-  (`bench/gsm8k_api.py`, first 200 test problems, greedy, thinking off, flex-scored; 1 of
-  the 6 misses hit the 1024-token cap). Pause the route record
-  (`touch <record dir>/pause`) while these run so eval traffic does not pick the cold set.
+  them.
 - **Tool-call replies can run away without the DSML stop.** (In the DSML tags below, `|` stands for
   U+FF5C, the fullwidth bar the model actually emits.) At `temperature=1.0` the
   model sometimes closes an invoke and then, instead of `</|DSML| calls>`, writes
@@ -630,68 +598,6 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   reply's three calls came back clean (without it that call is `{}`). bench7 with the repair:
   129.7 ms/step. `DSML_PARAM_REPAIR=0` turns it off.
 
-## Experimental: cold set from your own traffic (REXL3 overlay, local)
-
-Which experts go to the SSD side file matters more than how many. Measured on REXL3 in this
-image with a 17 GiB cold set (`RESERVE_GIB=12`), on held-out Hermes agent requests, greedy:
-
-| cold set picked from | reserve unused | 11 GiB of the reserve in use |
-|---|---|---|
-| bench prompts (bench7 + prefill ladder) | 23.5 tok/s | 4.6 tok/s |
-| Hermes traffic (permanent record) | 25.7 tok/s | 16.4 tok/s |
-
-The bench-picked set takes ~11 % of agent routes; the traffic-picked one ~0.5-1.3 %.
-
-- Record: `ROUTE_STATS=1 DYN_RESIDENCY=1 DYN_RESIDENCY_MAX_SWAPS=0` keeps a permanent
-  per-expert route count in `$DYN_RESIDENCY_STATE_DIR` (default
-  `~/.cache/dsv41-ds41f/route-heat/route-heat-$MODEL_NAME.npz`), added to across boots and
-  saved by a background thread every `DYN_RESIDENCY_SAVE_S` (300) s when the counts changed
-  (idle servers included), with an atomic rename. `serve.sh` asks the running server to save
-  first (`flush.now` in the record dir, 15 s timeout), so a restart loses no counts.
-  `DYN_RESIDENCY_RECORD=0` turns it off; a file whose shape does not match the pack is not mixed in.
-  Benchmark traffic is recorded too: `touch <record dir>/pause` before a benchmark or eval replay and
-  `rm` it after; paused traffic is left out of the record (it still drives this boot's swaps).
-  The routes vLLM's profile run and CUDA-graph capture make at boot (dummy tokens, ~1.5 M per
-  boot, piled on a few experts) are never added: the counters are baselined at the first real step.
-  A marker that exists at boot pauses the record from that first step. (Before this fix it was
-  only read by the saver thread, which starts at the first residency tick, 64 steps in, so the
-  first minutes of a benchmark leaked in: 1.5-7.8 M routes per boot.) Checked live: 6 boots with
-  the marker set, 72 replayed Hermes requests and the restarts' flushes, record unchanged except for
-  the fading below (250,608,186 -> 250,560,557 routes).
-- Old traffic fades: at each boot the record's counts are scaled by 0.5^(days since its last save /
-  `DYN_RESIDENCY_HALF_LIFE_DAYS`) (14; 0 keeps every count). A week of coding a month ago then counts
-  for about a quarter of the same week now, so the cold set follows a change of use while the
-  history keeps its shape. Files written before this change carry no save time and are not scaled
-  at their first load.
-- Automatic: with `DYN_RESIDENCY=1` (or `AUTO_COLD=1`) every `serve.sh` start runs
-  `tools/auto_cold.py` first. It re-picks the cold set from the record at the same budget
-  (`$ALIAS_DIR/plan.json` `cold_gib`, else `AUTO_COLD_GIB`) and rebuilds the side file only when
-  that cuts the expected bytes a decode step reads from cold experts (sum of q_e x expert bytes, the
-  quantity the picker's coldest-first fill minimizes for a byte budget; experts are 4.2-16.9 MiB) by
-  more than `AUTO_COLD_MIN_GAIN` (0.05 = 5 %); the new file
-  is built beside the old one and renamed in. `AUTO_COLD=0` keeps the side file as it is.
-  Measured: a forced rebuild (`AUTO_COLD_MIN_GAIN=-1`, 17.02 GiB) added ~25 s to the restart
-  (boot to ready 233 s vs 222 s when skipped); the build needs ~18 GiB free disk beside the old file.
-- Rebuild by hand: `RESERVE_GIB=12 python3 tools/plan_reserve.py --npz <record> --build`
-- Sizing the reserve: `plan_reserve.py` also prints the reserve cgroup's peak (`reserve.slice`, or
-  `RESERVE_CGROUP`) and the `RESERVE_GIB` that 1.5x that peak needs. The peak resets with the slice, so
-  judge it after a long stretch of real Hermes use (LIMCARS keeps the highest one seen).
-  Measured (2026-11-04, 12 scored Hermes tool tasks plus 6 engine boots, every process outside the
-  engine container sampled every 2 s): the whole rest of the box peaked at 3.47 GiB RSS (NX remote
-  desktop 1.09, Hermes's background process ~0.45, the `hermes chat` CLI 0.12, gnome-shell 0.31), and
-  most of that is already running when the planner measures free memory. What the reserve
-  costs when nobody uses it (calibration boots): 34.0 tok/s with the 7.2 GiB shipped cold set
-  (`RESERVE_GIB` ~2) vs 32.3 tok/s at 17 GiB cold (`RESERVE_GIB=12`), about 5 %; `RESERVE_GIB=6` puts
-  10.8 GiB cold. The default stays 12 GiB: that 5 % buys room for a browser tool, a build or a second
-  model client without the 0.5 GiB guard stopping the engine. A box that only runs Hermes and a
-  dashboard can use `RESERVE_GIB=6`.
-  (or `tools/ats_build_alias.py --select-npz <record> --budget-gib <n>`), then serve with the
-  `ALIAS_DIR`/`COLD_SELECTION` it prints.
-- Inspect: `python3 tools/cold_share_eval.py --eval <record> <selection.json>` prints the share of
-  recorded routes a selection would send to the SSD. Back up = copy the file; reset = delete it.
-- Replay saved Hermes requests to seed it (no tools run): `bench/replay_hermes.py`;
-  decode check: `bench/hermes_decode.py`.
-
 ## Known limits
 
 - **Oversized sampling lists get a 400, not a crash.** The DSpark path samples on vLLM's
@@ -704,37 +610,7 @@ The bench-picked set takes ~11 % of agent routes; the traffic-picked one ~0.5-1.
   kernel work continues on the fork branch. At the measured 4.7 accepted tokens/step,
   ~48 tok/s needs ~42 ms out of a 140 ms step (~50 tok/s needs ~45 ms); the
   ranked candidates and the arithmetic are in `docs/ENGINEERING_NOTES.md`.
-- **Vision is on by default** (`VISION_IMAGES=1`; `VISION_IMAGES=0` gives `--language-model-only`, which sets every image limit to 0; text-only was the default until the 6-boot A/B below). The image's
-  SM12x model path (`vllm/models/deepseek_v4_1/nvidia/vl_model.py`) does build a native vision tower,
-  and keeps MTP. The pack carries it: 259 tensors, 0.77 GiB BF16, all in shard 00001. `VISION_IMAGES=N`
-  serves up to N images per prompt instead. Measured (REXL3 1.55 bpw, `VISION_IMAGES=1`, same flags):
-
-  | | text only | vision on (`VISION_IMAGES=1`) |
-  |---|---|---|
-  | boot to ready | 220 s | 244 s |
-  | MemAvailable at steady state | 13.72 GiB | 11.90 GiB (**~1.8 GiB** for the tower and its buffers) |
-  | Hermes decode, 3 held-out requests x 2 passes | 24.4 tok/s | 25.5 tok/s (same within noise) |
-  | 768x512 test image, "describe shapes, colours, text" | n/a | correct ("red circle", "blue rectangle", "SPARK 42"), 7.0 s, 62 tokens |
-
-  **Tower weights from the SSD (`DSV41_VISION_ATS=1`, the default with vision on).** The 263 vision and
-  aligner BF16 tensors (0.90 GiB) are mapped from shard 00001 through the page cache instead of a GPU copy;
-  each is checked against the index (dtype, shape, 16-byte alignment) and byte-compared with the loaded
-  tensor before the swap. GPU memory after load: 94.05 GiB, the same as text-only. The kernel can drop
-  those pages under pressure and re-reads them on the next image (cold image 15.5 s, warm 6.7 s, both
-  correct). Alternating A/B, same image, record paused, 3 boots each, 12 Hermes-derived requests per boot:
-
-  | | text only | vision on, tower from the SSD |
-  |---|---|---|
-  | boot to ready | 209 / 210 / 209 s | 219 / 220 / 220 s |
-  | MemAvailable idle after boot | 13.02 / 13.59 / 13.43 GiB (13.35) | 12.59 / 12.71 / 12.68 GiB (12.66, **~0.7 GiB**) |
-  | decode, token-weighted, per boot | 22.3 / 23.4 / 23.1 tok/s | 23.0 / 23.6 / 23.4 tok/s |
-  | decode, all 36 requests | **22.9 tok/s** | **23.3 tok/s** (same within noise) |
-
-  An earlier single pair of boots read 25.2 vs 22.8 tok/s; the spread between boots of the same
-  setting (up to 1.1 tok/s here) is larger than the difference between the settings.
-
-  The image counts ~300 prompt tokens. With `max_tokens=200` the whole budget went to reasoning and the
-  reply was empty; give image requests room to think.
+- **Vision is not enabled** (`--language-model-only`); no image path was measured.
 - **Chat endpoint: no chat template ships in the pack, and none is needed.** The
   Hub revision has no `chat_template.jinja` and neither `tokenizer_config.json`
   nor `tokenizer.json` carries a `chat_template` field. `--tokenizer-mode
@@ -754,7 +630,7 @@ The bench-picked set takes ~11 % of agent routes; the traffic-picked one ~0.5-1.
   template or chat will 400.
 - **Image build: built and served from scratch on the measurement box.**
   `scripts/build_image.sh` on a fresh clone built the image in 269.6 s (+3.6 GB on
-  the base); served through `scripts/serve.sh` with a freshly built alias and the
+  the base); served through `packs/1.62bpw/scripts/serve.sh` with a freshly built alias and the
   Hub file set, it measured 145.5 ms/step, 4.71 tok/step, 31.9 tok/s at
   `--max-model-len 524288` (bench7, previous pin `exllamav3@42981e6`), passed
   `smoke.sh`, answered chat, and found a needle at 131K. The current pin
@@ -781,11 +657,11 @@ The bench-picked set takes ~11 % of agent routes; the traffic-picked one ~0.5-1.
   Measured on one box, same image and pack: cold cache with the stock worker
   counts **min 1.43 GiB**; cold cache with `B12X_*_COMPILE_WORKERS=1` and
   `TVM_NUM_THREADS=1` / `TVM_BIND_THREADS=1` **min 2.67 GiB**, ready 302 s vs 305 s.
-  `scripts/serve.sh` applies those overrides automatically while the JIT cache is
+  `packs/1.62bpw/scripts/serve.sh` applies those overrides automatically while the JIT cache is
   cold, i.e. until a boot has reached ready once and left `$CACHE_DIR/kkref/jit/.warm`
   (a boot killed half-way leaves no marker, so the next one is serialised again).
   That first boot serves normally, but the speed figures were measured with the
-  stock worker settings: run `scripts/serve.sh` once more after it is ready. The
+  stock worker settings: run `packs/1.62bpw/scripts/serve.sh` once more after it is ready. The
   kernels persist in `$CACHE_DIR/kkref/jit` (mounted at `/cache`) and later boots
   compile nothing. Every number in this README was measured with a warm cache.
 - **Steady MemAvailable can be lower than measured here.** The same from-scratch
@@ -834,15 +710,15 @@ side file only works because device and host memory are the same pool.
 The numbers were measured on a pack downloaded at revision `7cdebca3`. The Hub
 repo's history has since been replaced three times, each time with a single
 `Initial commit` holding the same weights (`04f7138b`, `2a6059359c68`, then
-`c852150e06f5`), so old commit ids stop resolving. `scripts/env.sh` pins the current
+`c852150e06f5`), so old commit ids stop resolving. `packs/1.62bpw/scripts/env.sh` pins the current
 one, `c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960`; the Hub revision has 27 files and the
-21 this recipe needs all match `scripts/SHA256SUMS` (sha256 of the 17 shards, the
+21 this recipe needs all match `packs/1.62bpw/scripts/SHA256SUMS` (sha256 of the 17 shards, the
 index, `config.json`, `tokenizer.json` and `tokenizer_config.json`; checked
 2026-10-20). The other six (`.gitattributes`, `LICENSE`, `README.md`,
 `chat_template.jinja`, `engram_token_map.u32`, `generation_config.json`) are not in
 `SHA256SUMS`.
 
-**`scripts/SHA256SUMS` is the authority, not the commit id.** If the pinned
+**`packs/1.62bpw/scripts/SHA256SUMS` is the authority, not the commit id.** If the pinned
 revision is gone, `download_and_verify.sh` downloads `main` with a warning and
 the sha256 check decides whether it is the measured pack. A mismatch means the
 weights changed; do not serve it as this recipe.
@@ -869,99 +745,36 @@ from-scratch install without them boots, passes `smoke.sh`, answers
   with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
 - Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by
   [vcruz305](https://huggingface.co/vcruz305).
-- REXL3-on-vLLM overlay, reserve planner, tenant caps, route record, automatic cold-set
-  rebuild and the `bench/` evals: AgentSparko, on top of the above.
-- Scripts: MIT.
+- Recipe scripts: MIT.
 
 ## Repo layout
+
+Shared engine pieces (identical for both packs):
 
 | Path | What |
 |---|---|
 | `AGENTS.md` | short brief for AI agents: what this serves, the Do-not list, where the commands are |
-| `scripts/env.sh` | pins (model revision, image, fork/plugin SHAs), paths, serve knobs |
-| `scripts/download_and_verify.sh` | hf_xet download at the pinned revision + sha256 verification |
+| `scripts/env.sh` | shared pins: base/engine image, fork/plugin SHAs, host paths, serve knobs both packs measured the same |
 | `scripts/build_image.sh` | base engine + forks + shim image build |
 | `scripts/fetch_base.sh` | fetches the prebuilt base from Hugging Face, verifies it, reinstalls CUTLASS DSL |
+| `scripts/guard.sh` | memory guard, status, stop (restores sysctls) |
+| `scripts/smoke.sh` | plain completion check |
 | `base/` | the base image's build files (justincasey's, unmodified), `Dockerfile.cutlass-dsl`, `cutlass-dsl.lock` |
 | `docker/Dockerfile` | the layer: vllm-exl3, exllamav3 at tile-K 16, shim, TP1 decode tiles |
 | `docker/tp1_decode_tiles.py` | TP1 decode tile tables for the base image's FP8 TileLang linears |
-| `scripts/build_cold_alias.sh` | builds the cold-expert side file from your own pack copy |
+| `shim/` | `dsv41_exl3_shim`: quant-config name shim, no vLLM source changes |
 | `tools/ats_build_alias.py` | the gatherer (64-byte alignment, manifest, selection) |
 | `configs/cold-alias-selection.json` | the measured 1,418-expert membership |
-| `scripts/serve.sh` | host wrapper: docker run, sysctls, memory guard |
-| `scripts/serve_inner.sh` | the exact measured in-container vLLM invocation |
-| `scripts/guard.sh` | memory guard, status, stop (restores sysctls) |
-| `scripts/smoke.sh` | plain completion check |
-| `scripts/SHA256SUMS` | per-file sha256 for the pinned pack revision |
-| `shim/` | `dsv41_exl3_shim`: quant-config name shim, no vLLM source changes |
-| `bench/bench7.py` | ms/step, accepted tok/step, tok/s per class |
-| `bench/longprompt.py` | repeated-text prefill ladder |
-| `bench/prefill_varied_probe.py` | varied-text prefill ladder |
-| `bench/ctx_probe.py` | long-context probe: retrieval, prefill and decode at depth in one request |
-| `bench/compare_tf.py` | teacher-forced top-1 / dlogprob comparison |
+| `bench/` | the bench suite both packs measure through (bench7, prefill/long-context probes, and the 1.55 pack's API evals) |
 | `docs/ENGINEERING_NOTES.md` | what was tried, what won, and what lost |
-## Hermes multi-step tool tasks (measured 2026-11-04)
 
-`bench/hermes_tasks.py` runs 12 real tasks through `hermes chat` against :8000 (REXL3,
-repetition stop on), each in a fresh folder, and scores it with a hidden check the model
-never sees. The route record is paused for the run.
+The 1.62 bpw pack (`packs/1.62bpw/`):
 
-| Task | Pass | Time | Tool calls |
-|---|---|---|---|
-| fix-bug | ✅ | 80 s | 9 |
-| rename across files | ✅ | 136 s | 16 |
-| CSV totals | ✅ | 31 s | 2 |
-| find a file | ✅ | 25 s | 2 |
-| module + tests | ✅ | 195 s | 9 |
-| git branch flow | ✅ | 43 s | 5 |
-| CLI run | ✅ | 51 s | 3 |
-| JSON config edit | ✅ | 30 s | 3 |
-| LRU cache | ✅ | 182 s | 7 |
-| traceback fix | ✅ | 41 s | 6 |
-| multi-file feature | ✅ | 208 s | 14 |
-| log report | ✅ | 65 s | 4 |
-| **total** | **12/12** | **18.1 min** | **80** |
-
-No loops, no repetition stops, and the Hermes process tree peaked at 0.12 GiB RSS.
-
-## Repetition stop and loop detection (measured 2026-11-04)
-
-The shim gives every request that sets no `repetition_detection` the default
-`REP_STOP=64:512:8`: a reply ends with `finish_reason="repetition"` once its last 8 blocks
-of 64-512 tokens are identical. `REP_STOP=0` turns it off; a request's own setting wins.
-
-| Test | Result |
+| Path | What |
 |---|---|
-| Forced exact loop ("write this sentence 400 times") | stopped after 1,417 tokens (~35 s), `finish_reason="repetition"` |
-| Same loop, request opts out (`min_count: 0`) | ran to the 12,000-token cap (300 s), `finish_reason="length"` |
-| Short reply that legitimately repeats a line | `finish_reason="stop"`, full text |
-| Hermes FizzBuzz + tool calls | completed, no repetition event |
-| GSM8K, first 100 problems | 99/100 (0 truncated) |
-| HumanEval, first 40 problems | 40/40 |
-
-### What a loop looks like in the MTP counters
-
-With MTP (K=5), a model stuck in an exact loop is predicted perfectly by its own draft head:
-every draft is accepted, so acceptance pins at 6.00 tokens/step and the decode-speed chart
-shows a flat band at the ceiling. A real 9-minute Hermes reasoning loop held 6.00 every
-minute; normal reasoning sits at 2-3. Copying a file back verbatim does **not** pin it:
-
-| Case (acceptance every 5 s) | Tokens accepted per step | 5 s windows fully accepted | Longest run |
-|---|---|---|---|
-| Exact copy of a 13 KB JavaScript file | 4.6-6.0, mostly 5.2-5.8 | 1 of 25 | 5 s |
-| Exact copy of a Python file (after reasoning) | 4.5-5.8 while copying | 0 of 56 | 0 s |
-| Exact copy of 9 KB README prose | 4.4-5.5 | 0 of 18 | 0 s |
-| Code audit + full rewrite of a 22 KB script | 2.0-5.0, mostly ~3 | 0 of 68 | 0 s |
-| Real Hermes reasoning loop | 6.00 | every minute | ~9 min |
-
-[LIMCARS](https://github.com/AgentSparko/LIMCARS) marks the Gen speed tile "possible loop"
-after 30 s of full acceptance.
-
-Live check of a client-side cut (a Hermes patch that polls `/metrics` every 2 s and cuts a
-reply after 60 s of full acceptance), with the server stop opted out so the loop could run:
-the "write this sentence 400 times" prompt drove the model's reasoning into
-"I'll write 400 lines. I'll count chunks..." on repeat. Every draft was accepted from 68.7 s,
-and the cut fired at 128.3 s. Per-second counters from a second run: 0.2-0.6 of drafts
-accepted while reasoning normally, then 35/35 or 40/40 every second once the loop formed.
-A verbatim 13 KB file echo under the same watch ran to completion (longest fully accepted
-stretch 6.3 s, no cut).
+| `packs/1.62bpw/scripts/env.sh` | this pack's pins: model repo/revision/name, decode graph sizes |
+| `packs/1.62bpw/scripts/download_and_verify.sh` | hf_xet download at the pinned revision + sha256 verification |
+| `packs/1.62bpw/scripts/build_cold_alias.sh` | builds the cold-expert side file from your own pack copy |
+| `packs/1.62bpw/scripts/serve.sh` | host wrapper: docker run, sysctls, memory guard |
+| `packs/1.62bpw/scripts/serve_inner.sh` | the exact measured in-container vLLM invocation |
+| `packs/1.62bpw/scripts/SHA256SUMS` | per-file sha256 for the pinned pack revision |

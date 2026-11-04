@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run a non-engine program (Hermes, tools, dashboards) inside the memory the planner reserved.
 #
-#   RESERVE_GIB=12 bash scripts/tenant_scope.sh <unit-name> <command...>
+#   RESERVE_GIB=12 bash packs/1.55bpw-rexl3/scripts/tenant_scope.sh <unit-name> <command...>
 #
 # The engine cannot be capped from its own cgroup: its CUDA allocations are not charged
 # to the container's memcg (measured: memory.current ~4.5 GiB with ~100 GiB allocated).

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Share of expert routes that land in a cold set, on a held-out route histogram.
 
-  python3 tools/cold_share_eval.py --eval after.npz [--minus before.npz] sel1.json [sel2.json ...]
-  python3 tools/cold_share_eval.py --diff after.npz before.npz out.npz   # write a delta histogram
+  python3 packs/1.55bpw-rexl3/tools/cold_share_eval.py --eval after.npz [--minus before.npz] sel1.json [sel2.json ...]
+  python3 packs/1.55bpw-rexl3/tools/cold_share_eval.py --diff after.npz before.npz out.npz   # write a delta histogram
 
 Lower is better: each cold route is a read through the ATS alias (SSD when evicted)."""
 import json, sys

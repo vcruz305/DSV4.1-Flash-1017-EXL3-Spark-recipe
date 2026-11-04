@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Page-cache residency of files (mincore), e.g. the cold-expert side file.
 
-  python3 tools/pagecache_resident.py <file>...          # resident GiB / size
-  python3 tools/pagecache_resident.py --willneed <file>  # also re-request read-ahead
+  python3 packs/1.55bpw-rexl3/tools/pagecache_resident.py <file>...          # resident GiB / size
+  python3 packs/1.55bpw-rexl3/tools/pagecache_resident.py --willneed <file>  # also re-request read-ahead
 """
 import ctypes, mmap, os, sys
 

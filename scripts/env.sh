@@ -1,18 +1,15 @@
 #!/bin/bash
-# Shared pins and paths. Source this; do not execute it.
+# Shared pins and paths for both packs. Source this; do not execute it.
+#
+# This file holds what the two packs have in common: the engine/base image pins,
+# the runtime fork pins, the host paths and the serve knobs both packs measured
+# the same. Pack-specific pins and knobs (the pack's model directory, the
+# 1.62 pack's download pins, the 1.55 pack's MAX_NUM_SEQS/VISION_IMAGES) live
+# in packs/<pack>/scripts/env.sh, which sources this file first.
 #
 # Every value here is the measured configuration. Changing one without
-# re-measuring means the numbers in README.md no longer describe what you serve.
-
-# ---- model ----------------------------------------------------------------
-MODEL_REPO="vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw"
-# Hub revision to download. The repo's history has been replaced more than once
-# (each time a single "Initial commit" with the same files), so a commit id can
-# stop resolving. scripts/SHA256SUMS is the authority: download_and_verify.sh
-# falls back to main when this revision is gone, and the sha256 check decides.
-# See README "Pack revision".
-MODEL_REV="${MODEL_REV:-c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960}"
-MODEL_NAME="${MODEL_NAME:-dsv41-1.62bpw-v3}"          # directory name under $MODELS_DIR
+# re-measuring means the numbers in the pack READMEs no longer describe what
+# you serve.
 
 # ---- images ---------------------------------------------------------------
 # Base engine: Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329),
@@ -46,14 +43,17 @@ PLUGIN_REF="${PLUGIN_REF:-30e8b941376ce2d43bc8438439937c4809106635}"    # vllm-e
 MOE_TILESIZE_K="${MOE_TILESIZE_K:-16}"
 
 # ---- paths ----------------------------------------------------------------
+# The repository root. Both packs' run dirs live under it (runs/), the shared
+# build scripts (scripts/build_image.sh, scripts/guard.sh) resolve against it,
+# and the cold-alias membership (configs/cold-alias-selection.json) is shared
+# by both packs. Pack scripts reach their own pack folder through $HERE.
 RECIPE_HOME="${RECIPE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MODELS_DIR="${MODELS_DIR:-$HOME/models}"
-MODEL_DIR="${MODEL_DIR:-$MODELS_DIR/$MODEL_NAME}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/dsv41-ds41f}"
 ALIAS_DIR="${ALIAS_DIR:-$CACHE_DIR/alias-cold}"
 RUNS_DIR="${RUNS_DIR:-$RECIPE_HOME/runs}"
 
-# ---- serve ----------------------------------------------------------------
+# ---- serve ---------------------------------------------------------------
 CONTAINER="${CONTAINER:-dsv41-tp1}"
 API_PORT="${API_PORT:-8000}"
 # OpenAI model id the server answers to. Change it only to fit a front end that requires its
@@ -64,10 +64,10 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv41}"
 # 0 = no server default.
 DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
 # Default sampling for requests that send no temperature/top_p. Agent clients (Hermes among them)
-# send neither, so without this they ran at vLLM's neutral temperature 1.0 / top_p 1.0, which on this
-# 1.62 bpw quant behind greedy MTP drafts meant repetition loops, a ~3x longer reply per tool call
-# (906 vs 277 completion tokens, 46.7 vs 12.3 s) and 83 % vs 89 % valid tool calls (README "Request
-# defaults"). 0.6 / 0.95 measured best; 0.95 is the model card's top_p. A client value still wins.
+# send neither, so without them they ran at vLLM's neutral temperature 1.0 / top_p 1.0, which on
+# this quant behind greedy MTP drafts meant repetition loops, a ~3x longer reply per tool call
+# (906 vs 277 completion tokens, 46.7 vs 12.3 s) and 83 % vs 89 % valid tool calls. 0.6 / 0.95
+# measured best; 0.95 is the model card's top_p. A client value still wins.
 # Empty = no default.
 DEFAULT_TEMPERATURE="${DEFAULT_TEMPERATURE:-0.6}"
 DEFAULT_TOP_P="${DEFAULT_TOP_P:-0.95}"
@@ -76,12 +76,9 @@ KVB="${KVB:-1073741824}"        # 1 GiB KV pool (vLLM reports 959,768 tokens at 
 MNBT="${MNBT:-2112}"
 LPT="${LPT:-2047}"
 MTP_K="${MTP_K:-5}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"   # requests decoded together; >1 is opt-in (README "Parallel requests")
-# decode graphs for every batch size up to (MTP_K+1) tokens x MAX_NUM_SEQS (1..7 at the defaults)
-CAPTURE_SIZES="${CAPTURE_SIZES:-$(seq -s, 1 $(( MAX_NUM_SEQS > 1 ? (MTP_K + 1) * MAX_NUM_SEQS : 7 )))}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 # INERT in this recipe: vLLM ignores --gpu-memory-utilization whenever
-# --kv-cache-memory-bytes (KVB below) is set, and serve_inner.sh always passes
+# --kv-cache-memory-bytes (KVB above) is set, and serve_inner.sh always passes
 # KVB. At boot the engine logs "reserved ... for KV Cache as specified by
 # kv_cache_memory_bytes config and skipped memory profiling. This does not
 # respect the gpu_memory_utilization config". Changing GPU_MEM_UTIL changes
@@ -91,14 +88,13 @@ PREFIX_CACHING="${PREFIX_CACHING:-1}"   # 1 = reuse KV of repeated prefixes (def
 DSML_STOP="${DSML_STOP:-1}"             # 1 = end tool-call replies at the first closing tag after a DSML invoke
 DSML_PARAM_REPAIR="${DSML_PARAM_REPAIR:-1}"  # 1 = strip junk closing-tag runs from DSML parameters whose closer is missing
 REP_STOP="${REP_STOP:-64:512:8}"         # MIN:MAX:COUNT = end a reply whose last COUNT blocks of MIN..MAX tokens repeat exactly; 0 = off
-VISION_IMAGES="${VISION_IMAGES:-1}"       # N = accept up to N images per prompt (default 1; tower served from the pack, ~0.7 GiB); 0 = text only (--language-model-only)
 ATS_LAYERS="${ATS_LAYERS:-38,39}"
 ATS_MTP="${ATS_MTP:-1}"
 ATS_EMBED="${ATS_EMBED:-1}"
 
-export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
+export BASE_IMAGE IMAGE
 export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
-export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MAX_NUM_SEQS MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR REP_STOP VISION_IMAGES
+export RECIPE_HOME MODELS_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
+export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR REP_STOP
 export ATS_LAYERS ATS_MTP ATS_EMBED

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Checks of the route record (scripts/py/dyn_residency.py) without an engine:
+"""Checks of the route record (packs/1.55bpw-rexl3/scripts/py/dyn_residency.py) without an engine:
 paused-at-boot traffic never reaches the file, and old counts fade so recent use wins.
-Run: python3 tools/test_dyn_record.py"""
+Run: python3 packs/1.55bpw-rexl3/tools/test_dyn_record.py"""
 import importlib.util
 import json
 import os

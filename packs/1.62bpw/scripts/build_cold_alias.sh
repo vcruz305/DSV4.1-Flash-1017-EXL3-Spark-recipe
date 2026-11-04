@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the cold-expert ATS alias side file from your own copy of the pack.
 #
-#   bash scripts/build_cold_alias.sh
+#   bash packs/1.62bpw/scripts/build_cold_alias.sh
 #
 # Writes $ALIAS_DIR/experts.bin (9,228,943,360 bytes: embed.weight + 1,418
 # coldest experts x w1/w2/w3, every tensor 64-byte aligned) and

@@ -18,7 +18,7 @@ Log: $VLLM_EXL3_ROUTE_STATS_DIR/dynres.jsonl, one line per tick.
 
 Permanent record: with DYN_RESIDENCY_STATE=<file.npz> the cumulative route counts of every
 boot are added to that file (loaded at the first tick, saved every _SAVE_S=300 s, same
-layout as a route_stats dump, so tools/plan_reserve.py --npz reads it). A saver thread writes it
+layout as a route_stats dump, so packs/1.55bpw-rexl3/tools/plan_reserve.py --npz reads it). A saver thread writes it
 when the counts changed and SAVE_S passed, or at once when <record dir>/flush.now appears
 (serve.sh touches it before a restart, so idle-time and last-minutes counts are not lost).
 While <record dir>/pause exists the traffic is not added to the record (benchmarks, eval replays);

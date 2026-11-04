@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-pick the SSD cold set from the permanent route record before a boot (serve.sh AUTO_COLD=1).
 
-  python3 tools/auto_cold.py --alias-dir DIR --model-dir DIR --record FILE [--min-gain 0.002]
+  python3 packs/1.55bpw-rexl3/tools/auto_cold.py --alias-dir DIR --model-dir DIR --record FILE [--min-gain 0.002]
 
 Same byte budget as the current side file (its plan.json cold_gib, else its size). The coldest
 experts by the record are chosen (ats_build_alias --select-only). Both sets are scored by the
@@ -17,6 +17,8 @@ import argparse, json, os, shutil, subprocess, sys, time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# ats_build_alias.py is shared with the 1.62 pack and lives at the repo root
+ATS = os.path.join(HERE, "..", "..", "..", "tools", "ats_build_alias.py")
 ap = argparse.ArgumentParser()
 ap.add_argument("--alias-dir", required=True)
 ap.add_argument("--model-dir", required=True)
@@ -67,11 +69,11 @@ gib = json.load(open(plan)).get("cold_gib") if os.path.exists(plan) else None
 gib = float(os.environ.get("AUTO_COLD_GIB") or gib or man["bytes"] / 2**30)
 tmp = a.alias_dir.rstrip("/") + ".auto"
 shutil.rmtree(tmp, ignore_errors=True)
-base = [sys.executable, os.path.join(HERE, "ats_build_alias.py"), "--model-dir", a.model_dir,
+base = [sys.executable, ATS, "--model-dir", a.model_dir,
         "--out", tmp, "--embed", "--align", "64", "--select-npz", a.record, "--budget-gib", f"{gib:.4f}"]
 subprocess.run(base + ["--select-only"], check=True, stdout=subprocess.DEVNULL)
 new = json.load(open(os.path.join(tmp, "selection.json")))
-sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(ATS))
 from ats_build_alias import _scan_expert_bytes  # noqa: E402
 wm = json.load(open(os.path.join(a.model_dir, "model.safetensors.index.json")))["weight_map"]
 nbytes = {k: v[0] for k, v in _scan_expert_bytes(a.model_dir, wm).items()}

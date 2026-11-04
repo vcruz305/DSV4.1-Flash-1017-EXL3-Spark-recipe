@@ -44,7 +44,7 @@ snapshot() {
     if awk -v c="$cache_gib" 'BEGIN{exit !(c < 1.5)}'; then
       echo "WARNING: this boot came up with little page cache; it will likely decode 1.5-3x slow" >&2
       echo "         for its whole life. Free host memory first (systemctl isolate multi-user.target," >&2
-      echo "         stop heavy services), then restart once: bash scripts/guard.sh stop && bash scripts/serve.sh" >&2
+      echo "         stop heavy services), then restart once: bash scripts/guard.sh stop && bash packs/<your-pack>/scripts/serve.sh" >&2
     fi
   fi
   # serve.sh's stage watcher drops this file in $RUN at ready when the page
