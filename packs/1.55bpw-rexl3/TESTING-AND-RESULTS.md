@@ -24,9 +24,8 @@ Built on [vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vcruz
 memory guard and his own 1.62 bpw pack. That serve path is kept and still works unchanged
 (`MODEL_NAME` default); see "Credits and license".
 
-**Models (Hugging Face):** SAGE REXL3 1.55 bpw and SAGE EXL3 1.62 bpw by
-[vcruz305](https://huggingface.co/vcruz305) (gated: accept the terms once, then use a token).
-Base model: <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017>
+**Models (Hugging Face):** [vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw) and
+[vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw) (gated: accept the terms once, then use a token).
 
 Both packs hold SAGE MixedK EXL3 routed experts, EXL3 MTP draft experts and the Engram n-gram
 tables; the Engram tables are streamed from NVMe. Neither pack fits fully resident under vLLM on
@@ -867,8 +866,9 @@ from-scratch install without them boots, passes `smoke.sh`, answers
   component in the image; NVIDIA CUTLASS DSL is not in it and is installed from PyPI.
 - Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels
   with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
-- Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by
-  [vcruz305](https://huggingface.co/vcruz305).
+- Models: [vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw) and
+  [vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw),
+  DeepSeek-V4.1-Flash-1017 (MIT) quantized by vcruz305.
 - REXL3-on-vLLM overlay, reserve planner, tenant caps, route record, automatic cold-set
   rebuild and the `bench/` evals: AgentSparko, on top of the above.
 - Scripts: MIT.

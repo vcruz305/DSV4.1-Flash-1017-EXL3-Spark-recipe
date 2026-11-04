@@ -14,8 +14,6 @@ AgentSparko's overlay path) lives in `packs/1.55bpw-rexl3/`.
 **Model (Hugging Face):** <https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw>
 (public, gated: accept the terms once, then use a token).
 
-Base model: <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017>
-
 The pack holds SAGE MixedK EXL3 routed experts (mixed K1-K4 per projection,
 1.62 bpw), EXL3 MTP draft experts, an EXL3 K8 output head, native block-32 FP8
 for every other linear, and the Engram n-gram tables. The Engram tables are
@@ -743,8 +741,8 @@ from-scratch install without them boots, passes `smoke.sh`, answers
   component in the image; NVIDIA CUTLASS DSL is not in it and is installed from PyPI.
 - Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels
   with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
-- Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by
-  [vcruz305](https://huggingface.co/vcruz305).
+- Model: [vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw),
+  DeepSeek-V4.1-Flash-1017 (MIT) quantized by vcruz305.
 - Recipe scripts: MIT.
 
 ## Repo layout
