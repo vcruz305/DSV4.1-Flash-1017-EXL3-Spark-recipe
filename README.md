@@ -227,6 +227,8 @@ Measured on the live serve (temperature 0):
 - The same request for 15 lines (397 tokens) finished normally (`stop`).
 - A short Hermes tool-using task (write a module and its tests, run pytest) completed with
   no repetition stop. Synthetic check cost: ~0.08 ms per step.
+- Quality with the stop on: GSM8K first 100 problems 99/100, HumanEval first 40 problems
+  40/40, no answer cut short.
 
 ## Client timeouts and queueing
 
