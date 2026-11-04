@@ -4,6 +4,8 @@
 from the 1.55 bpw SAGE REXL3 pack, with the rarely used experts read from the SSD and picked from
 your own traffic.**
 
+📦 **Model (Hugging Face):** <https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw> (gated: accept the terms once, then use a token).
+
 > 📚 Every measurement, flag and limit is in **[TESTING-AND-RESULTS.md](TESTING-AND-RESULTS.md)**.
 > This page is the short version.
 
@@ -74,7 +76,8 @@ Full prerequisites: [TESTING-AND-RESULTS.md → Quick start](TESTING-AND-RESULTS
 git clone https://github.com/vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe.git
 cd DSV4.1-Flash-1017-EXL3-Spark-recipe
 bash scripts/build_image.sh                    # vLLM image (base fetched from Hugging Face)
-# download vcruz305's SAGE REXL3 1.55 bpw pack to ~/models/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw
+HF_XET_HIGH_PERFORMANCE=1 hf download vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw \
+  --local-dir ~/models/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw   # the 1.55 bpw pack
 bash packs/1.55bpw-rexl3/scripts/build_rexl3_overlay.sh   # make it loadable by vLLM (GPU must be free)
 MODEL_NAME=rexl3-vic-overlay HF_OVERRIDES_JSON="$(python3 packs/1.55bpw-rexl3/tools/rexl3_overrides.py)" \
   RESERVE_GIB=12 ROUTE_STATS=1 DYN_RESIDENCY=1 DYN_RESIDENCY_MAX_SWAPS=0 bash packs/1.55bpw-rexl3/scripts/serve.sh
@@ -121,8 +124,8 @@ Before running benchmarks, run `touch ~/.cache/dsv41-ds41f/route-heat/pause` so 
 
 ## 📄 Credits and license
 
-- 🐋 Model: [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) by DeepSeek.
-- 📦 SAGE REXL3 1.55 bpw and SAGE EXL3 1.62 bpw packs, the base recipe ([DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe)), [vllm-exl3](https://github.com/vcruz305/vllm-exl3)
+- 🐋 Model: DeepSeek-V4.1-Flash-1017 by DeepSeek.
+- 📦 [SAGE REXL3 1.55 bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw) and [SAGE EXL3 1.62 bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw) packs, the base recipe ([DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe)), [vllm-exl3](https://github.com/vcruz305/vllm-exl3)
   and the [exllamav3 fork](https://github.com/vcruz305/exllamav3): **vcruz305 (Victor Cruz)**.
 - ⚙️ Base engine: [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f), on justincasey's base recipe;
   [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by turboderp; [vLLM](https://github.com/vllm-project/vllm).

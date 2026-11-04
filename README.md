@@ -17,8 +17,6 @@ suite and the base-image build are shared at the top level.
 | Memory for other apps | none reserved | `RESERVE_GIB` (default 12) reserved and capped for tenants |
 | Folder | [`packs/1.62bpw/`](packs/1.62bpw/README.md) | [`packs/1.55bpw-rexl3/`](packs/1.55bpw-rexl3/README.md) |
 
-Base model: <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017>
-
 ## Quick start (either pack)
 
 The shared engine image is built once, from the repository root:
@@ -33,7 +31,8 @@ Then follow the pack's own quick start:
   build the alias side file with `packs/1.62bpw/scripts/build_cold_alias.sh`, serve with
   `packs/1.62bpw/scripts/serve.sh`. Full measured quick start, prerequisites and numbers:
   [`packs/1.62bpw/README.md`](packs/1.62bpw/README.md).
-- **1.55 bpw REXL3 pack:** build the overlay with
+- **1.55 bpw REXL3 pack:** download [the pack](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw) to
+  `~/models/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw`, build the overlay with
   `packs/1.55bpw-rexl3/scripts/build_rexl3_overlay.sh`, then serve with
   `MODEL_NAME=rexl3-vic-overlay HF_OVERRIDES_JSON="$(python3 packs/1.55bpw-rexl3/tools/rexl3_overrides.py)"`
   and the reserve/route flags. Full quick start:
@@ -61,8 +60,9 @@ in one pack's folder is read by the other pack's serve path.
 
 ## Credits and license
 
-- Model: DeepSeek-V4.1-Flash-1017 by DeepSeek; both packs quantized by
-  [vcruz305 (Victor Cruz)](https://huggingface.co/vcruz305), who also wrote this
+- Packs: [vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw) and
+  [vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-REXL3-1.55bpw), both quantized
+  from DeepSeek-V4.1-Flash-1017 by vcruz305 (Victor Cruz), who also wrote this
   recipe's engine path: the derived vLLM image, the tuned flag set, the
   cold-expert alias side file, the memory guard, and every 1.62 bpw measurement.
 - Engine: [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f)
