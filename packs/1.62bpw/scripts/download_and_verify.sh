@@ -1,9 +1,9 @@
 #!/bin/bash
 # Download the pack at the pinned revision with hf_xet, then verify every file
-# against scripts/SHA256SUMS (the Hub's own LFS sha256 for the 17 shards and the
+# against packs/1.62bpw/scripts/SHA256SUMS (the Hub's own LFS sha256 for the 17 shards and the
 # index, plus sha256 of the three small files).
 #
-#   HF_TOKEN=hf_... bash scripts/download_and_verify.sh
+#   HF_TOKEN=hf_... bash packs/1.62bpw/scripts/download_and_verify.sh
 #
 # The repo is public but gated: the token must belong to an account that has
 # accepted the model's terms. The token is never printed.
@@ -74,7 +74,7 @@ except HfHubHTTPError as exc:
     main = api.model_info(repo).sha
     print(f"WARNING: pinned revision {rev[:12]} no longer exists on the Hub "
           f"(history replaced); downloading main = {main[:12]} instead. "
-          f"scripts/SHA256SUMS decides whether it is the measured pack.")
+          f"packs/1.62bpw/scripts/SHA256SUMS decides whether it is the measured pack.")
     rev = main
 print(f"downloading {repo}@{rev[:12]} -> {dest}")
 snapshot_download(
@@ -87,7 +87,7 @@ snapshot_download(
 )
 PY
 
-echo "verifying against scripts/SHA256SUMS"
+echo "verifying against packs/1.62bpw/scripts/SHA256SUMS"
 cd "$MODEL_DIR"
 sha256sum -c "$HERE/SHA256SUMS"
 echo "VERIFY PASS: every file matches the pinned manifest"

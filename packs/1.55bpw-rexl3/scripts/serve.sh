@@ -1,11 +1,11 @@
 #!/bin/bash
 # Host wrapper: launch the serving container on ONE DGX Spark. Detached.
 #
-#   bash scripts/serve.sh              # measured configuration
-#   DRY_RUN=1 bash scripts/serve.sh    # print the docker command, run nothing
+#   bash packs/1.55bpw-rexl3/scripts/serve.sh  # measured configuration
+#   DRY_RUN=1 bash packs/1.55bpw-rexl3/scripts/serve.sh    # print the docker command, run nothing
 #
 # Requires passwordless docker (sudo -n), the pack downloaded and verified, and
-# the alias side file built (scripts/build_cold_alias.sh).
+# the alias side file built (packs/1.62bpw/scripts/build_cold_alias.sh).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +51,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "vllm serve /models/$MODEL_NAME --served-model-name $SERVED_MODEL_NAME --tokenizer-mode deepseek_v41 \\"
   echo "  --dtype bfloat16 --tensor-parallel-size 1 --distributed-executor-backend uni \\"
   echo "  --quantization exl3_dsv41 --block-size 256 $PCF --enable-chunked-prefill \\"
-  echo "  --max-model-len $MAXLEN --max-num-seqs 1 --max-parallel-prefills 1 \\"
+  echo "  --max-model-len $MAXLEN --max-num-seqs $MAX_NUM_SEQS --max-parallel-prefills 1 \\"
   echo "  --max-num-batched-tokens $MNBT --gpu-memory-utilization $GPU_MEM_UTIL \\"
   echo "  --kv-cache-memory-bytes $KVB --generation-config vllm --attention-backend tilelang \\"
   gen_json=""
@@ -68,7 +68,8 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  --speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$MTP_K,...} \\"
   echo "  --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice \\"
   echo "  --long-prefill-token-threshold $LPT --async-scheduling --no-scheduler-reserve-full-isl \\"
-  echo "  --no-enable-flashinfer-autotune --language-model-only --mm-processor-cache-gb 0 \\"
+  if [ "$VISION_IMAGES" = "0" ]; then MMDRY="--language-model-only"; else MMDRY="--limit-mm-per-prompt {\"image\": $VISION_IMAGES}"; fi
+  echo "  --no-enable-flashinfer-autotune $MMDRY --mm-processor-cache-gb 0 \\"
   echo "  --hf-overrides {...exl3 routed experts + deepseek_v41_fp8 non-routed...}"
   exit 0
 fi
@@ -101,12 +102,32 @@ if [ ! -f "$JIT_HOST/.warm" ]; then
 fi
 
 [ -d "$MODEL_DIR" ] || { echo "model dir not found: $MODEL_DIR" >&2; exit 1; }
+# Ask the running server to save its route record first (dyn_residency saver thread), so the
+# re-pick below and the next boot see its latest counts, idle-time ones included
+HEAT_HOST="${DYN_RESIDENCY_STATE_DIR:-$HOME/.cache/dsv41-ds41f/route-heat}"
+if [ "$DRY_RUN" != "1" ] && [ -d "$HEAT_HOST" ] && sudo -n docker ps -q -f "name=^${CONTAINER}\$" | grep -q .; then
+  touch "$HEAT_HOST/flush.now"
+  for _ in $(seq 15); do [ -f "$HEAT_HOST/flush.now" ] || break; sleep 1; done
+  if [ -f "$HEAT_HOST/flush.now" ]; then
+    rm -f "$HEAT_HOST/flush.now"; echo "route record: the running server did not flush (record off or older build)"
+  else
+    echo "route record: flushed by the running server"
+  fi
+fi
+# AUTO_COLD=1 (default with DYN_RESIDENCY=1): re-pick the SSD cold set from the permanent route
+# record before every boot; rebuilds the side file only when that clearly cuts cold routes
+REC_FILE="$HEAT_HOST/route-heat-$MODEL_NAME.npz"
+if [ "$DRY_RUN" != "1" ] && [ "${AUTO_COLD:-${DYN_RESIDENCY:-0}}" = 1 ] && [ -f "$ALIAS_DIR/manifest.json" ]; then
+  python3 "$HERE/../tools/auto_cold.py" --alias-dir "$ALIAS_DIR" --model-dir "$MODEL_DIR" --record "$REC_FILE" \
+    || echo "auto_cold failed; serving the current side file" >&2
+  [ -f "$ALIAS_DIR/selection.json" ] && COLD_SELECTION="$ALIAS_DIR/selection.json"
+fi
 [ -f "$ALIAS_DIR/experts.bin" ] || { echo "alias side file not found: $ALIAS_DIR/experts.bin (run build_cold_alias.sh)" >&2; exit 1; }
 [ -f "$ALIAS_DIR/manifest.json" ] || { echo "alias manifest not found: $ALIAS_DIR/manifest.json" >&2; exit 1; }
 # The side file must hold the membership this recipe ships. A side file built by an
 # earlier version has the same size but a different expert set (1,380 over 24 layers
 # before, 1,418 over 43 now) and serves measurably slower.
-if ! python3 - "$ALIAS_DIR/manifest.json" "$RECIPE_HOME/configs/cold-alias-selection.json" <<'PY'
+if ! python3 - "$ALIAS_DIR/manifest.json" "${COLD_SELECTION:-$RECIPE_HOME/configs/cold-alias-selection.json}" <<'PY'
 import json, sys
 have = json.load(open(sys.argv[1])).get("experts") or {}
 want = json.load(open(sys.argv[2]))
@@ -116,7 +137,7 @@ PY
 then
   echo "alias side file $ALIAS_DIR was built from a different expert selection than" >&2
   echo "configs/cold-alias-selection.json (an earlier recipe version?). Rebuild it:" >&2
-  echo "  bash scripts/build_cold_alias.sh        (~10-20 s, rewrites it in place)" >&2
+  echo "  bash packs/1.62bpw/scripts/build_cold_alias.sh  (~10-20 s, rewrites it in place)" >&2
   if [ "${ALLOW_ALIAS_MISMATCH:-0}" != "1" ]; then
     echo "(ALLOW_ALIAS_MISMATCH=1 serves it anyway)" >&2
     exit 1
@@ -197,6 +218,27 @@ TVM_ENV=()
 [ -n "${TVM_NUM_THREADS:-}" ] && TVM_ENV+=(-e "TVM_NUM_THREADS=$TVM_NUM_THREADS")
 [ -n "${TVM_BIND_THREADS:-}" ] && TVM_ENV+=(-e "TVM_BIND_THREADS=$TVM_BIND_THREADS")
 
+# PACK_FILTER=1: load only the tensors model.safetensors.index.json lists, for re-laid
+# (align_safetensors.py) or hard-link overlay packs (packs/1.55bpw-rexl3/scripts/py/sitecustomize.py).
+PACK_ENV=()
+[ "${PACK_FILTER:-0}" = 1 ] && PACK_ENV+=(-v "$HERE/py":/recipe-py:ro -v "$HERE/py/zz_recipe_hooks.pth":/usr/local/lib/python3.12/dist-packages/zz_recipe_hooks.pth:ro -e RECIPE_PY=/recipe-py)
+# ROUTE_STATS=1: per-layer route histogram for packs/1.55bpw-rexl3/tools/plan_reserve.py (dump: touch $RUN/ctr/route-stats/dump.now)
+[ "${ROUTE_STATS:-0}" = 1 ] && PACK_ENV+=(-e VLLM_EXL3_ROUTE_STATS=1 -e VLLM_EXL3_ROUTE_STATS_DIR=/mem/route-stats)
+# DYN_RESIDENCY=1: swap hot cold experts into CUDA slots at runtime (packs/1.55bpw-rexl3/scripts/py/dyn_residency.py; needs ROUTE_STATS=1)
+if [ "${DYN_RESIDENCY:-0}" = 1 ]; then
+  [ "${ROUTE_STATS:-0}" = 1 ] || { echo "DYN_RESIDENCY=1 needs ROUTE_STATS=1" >&2; exit 1; }
+  [ "${PACK_FILTER:-0}" = 1 ] || PACK_ENV+=(-v "$HERE/py":/recipe-py:ro -v "$HERE/py/zz_recipe_hooks.pth":/usr/local/lib/python3.12/dist-packages/zz_recipe_hooks.pth:ro -e RECIPE_PY=/recipe-py)
+  PACK_ENV+=(-e DYN_RESIDENCY=1)
+  # permanent route record, kept across boots (DYN_RESIDENCY_RECORD=0 disables)
+  if [ "${DYN_RESIDENCY_RECORD:-1}" = 1 ]; then
+    HEAT_DIR="${DYN_RESIDENCY_STATE_DIR:-$HOME/.cache/dsv41-ds41f/route-heat}"; mkdir -p "$HEAT_DIR"
+    PACK_ENV+=(-v "$HEAT_DIR":/heat -e "DYN_RESIDENCY_STATE=/heat/route-heat-$MODEL_NAME.npz")
+  fi
+  for v in EVERY MAX_SWAPS RATIO MIN DECAY VERIFY TEST_SWAPS SAVE_S SHORT; do
+    n=DYN_RESIDENCY_$v; [ -n "${!n:-}" ] && PACK_ENV+=(-e "$n=${!n}")
+  done
+fi
+
 sudo -n docker run -d --name "$CONTAINER" \
   --gpus all \
   --memory=118g --memory-swap=118g --oom-score-adj 1000 --ulimit core=0 \
@@ -216,6 +258,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -e B12X_STATE_COMPILE_WORKERS="${B12X_STATE_COMPILE_WORKERS:-2}" \
   -e B12X_WEIGHTS_COMPILE_WORKERS="${B12X_WEIGHTS_COMPILE_WORKERS:-4}" \
   "${TVM_ENV[@]}" \
+  "${PACK_ENV[@]}" \
   -e B12X_COMPILE_CACHE_DIR="$JIT/b12x/compile" \
   -e B12X_CUTE_COMPILE_CACHE_DIR="$JIT/b12x/cute" \
   -e B12X_DENSE_SPLITK_TURBO=1 -e B12X_W4A8_TINY_DECODE=0 \
@@ -241,6 +284,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -e VLLM_EXL3_MIXEDK_MODE=unified \
   -e VLLM_EXL3_TRIM_AFTER_LAYER=1 \
   -e VLLM_EXL3_MODEL_DIR="/models/$MODEL_NAME" \
+  -e HF_OVERRIDES_JSON="${HF_OVERRIDES_JSON:-}" \
   -e VLLM_EXL3_ATS_ALIAS=1 \
   -e VLLM_EXL3_ATS_ALIAS_DIR=/alias \
   -e VLLM_EXL3_ATS_ALIAS_LAYERS="$ATS_LAYERS" \
@@ -258,7 +302,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -e DSV41_REP_STOP="$REP_STOP" \
   -e VLLM_EXL3_MEM_WATERFALL=0 \
   -e VLLM_EXL3_MEM_WATERFALL_PATH= \
-  -e MAXLEN="$MAXLEN" -e KVB="$KVB" -e MNBT="$MNBT" -e LPT="$LPT" \
+  -e MAXLEN="$MAXLEN" -e MAX_NUM_SEQS="$MAX_NUM_SEQS" -e VISION_IMAGES="$VISION_IMAGES" -e KVB="$KVB" -e MNBT="$MNBT" -e LPT="$LPT" \
   -e PREFIX_CACHING="$PREFIX_CACHING" -e MTP_K="$MTP_K" -e CAPTURE_SIZES="$CAPTURE_SIZES" -e CG_MODE="$CG_MODE" \
   -e GPU_MEM_UTIL="$GPU_MEM_UTIL" \
   --entrypoint /bin/bash \
@@ -286,7 +330,7 @@ echo "preflight" >"$RUN/stage"
 READY_MEM_AWK='/^Cached:/{c=$2} /^MemFree:/{f=$2} END{printf "page cache %.2f GiB, free %.2f GiB\n", c/1048576, f/1048576}'
 CACHE_LOW_AWK="BEGIN{exit !(c < 1.5)}"
 # The two background processes below live as long as the server. They must not inherit
-# the caller's open files: under `flock LOCK bash scripts/serve.sh`, the sudo processes kept
+# the caller's open files: under `flock LOCK bash packs/1.55bpw-rexl3/scripts/serve.sh`, the sudo processes kept
 # the lock's descriptor and the lock stayed held until the server was stopped.
 no_inherited_fds() {
   local fd
@@ -312,7 +356,7 @@ no_inherited_fds() {
             echo "         experts will be re-read from NVMe on every step and decode will run"
             echo "         ~3x slower for the whole life of this boot. Free host memory"
             echo "         (systemctl isolate multi-user.target, stop heavy services), then"
-            echo "         restart once: bash scripts/guard.sh stop && bash scripts/serve.sh"
+            echo "         restart once: bash scripts/guard.sh stop && bash packs/1.55bpw-rexl3/scripts/serve.sh"
           } >"$2/slow-boot"
           cat "$2/slow-boot" >&2
         fi ;;
@@ -331,7 +375,7 @@ echo "stage watcher: pid $!"
 # $RUN/ready-mem when the server reports ready (see "Keep the disk quiet").
 
 # ---- memory guard ---------------------------------------------------------
-(no_inherited_fds sudo -n setsid nohup bash "$HERE/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP") \
+(no_inherited_fds sudo -n setsid nohup bash "$RECIPE_HOME/scripts/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP") \
   >/dev/null 2>&1 &
 # The guard itself waits up to 24 s (480 x 0.05 s) for the container to appear
 # before it arms, so a 10 s wait here raced the real arm and printed a false
