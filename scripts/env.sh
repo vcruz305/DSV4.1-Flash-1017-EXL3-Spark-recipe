@@ -12,7 +12,7 @@ MODEL_REPO="vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw"
 # falls back to main when this revision is gone, and the sha256 check decides.
 # See README "Pack revision".
 MODEL_REV="${MODEL_REV:-c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960}"
-MODEL_NAME="dsv41-1.62bpw-v3"          # directory name under $MODELS_DIR
+MODEL_NAME="${MODEL_NAME:-dsv41-1.62bpw-v3}"          # directory name under $MODELS_DIR
 
 # ---- images ---------------------------------------------------------------
 # Base engine: Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329),
@@ -76,7 +76,9 @@ KVB="${KVB:-1073741824}"        # 1 GiB KV pool (vLLM reports 959,768 tokens at 
 MNBT="${MNBT:-2112}"
 LPT="${LPT:-2047}"
 MTP_K="${MTP_K:-5}"
-CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"   # requests decoded together; >1 is opt-in (README "Parallel requests")
+# decode graphs for every batch size up to (MTP_K+1) tokens x MAX_NUM_SEQS (1..7 at the defaults)
+CAPTURE_SIZES="${CAPTURE_SIZES:-$(seq -s, 1 $(( MAX_NUM_SEQS > 1 ? (MTP_K + 1) * MAX_NUM_SEQS : 7 )))}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 # INERT in this recipe: vLLM ignores --gpu-memory-utilization whenever
 # --kv-cache-memory-bytes (KVB below) is set, and serve_inner.sh always passes
@@ -89,6 +91,7 @@ PREFIX_CACHING="${PREFIX_CACHING:-1}"   # 1 = reuse KV of repeated prefixes (def
 DSML_STOP="${DSML_STOP:-1}"             # 1 = end tool-call replies at the first closing tag after a DSML invoke
 DSML_PARAM_REPAIR="${DSML_PARAM_REPAIR:-1}"  # 1 = strip junk closing-tag runs from DSML parameters whose closer is missing
 REP_STOP="${REP_STOP:-64:512:8}"         # MIN:MAX:COUNT = end a reply whose last COUNT blocks of MIN..MAX tokens repeat exactly; 0 = off
+VISION_IMAGES="${VISION_IMAGES:-1}"       # N = accept up to N images per prompt (default 1; tower served from the pack, ~0.7 GiB); 0 = text only (--language-model-only)
 ATS_LAYERS="${ATS_LAYERS:-38,39}"
 ATS_MTP="${ATS_MTP:-1}"
 ATS_EMBED="${ATS_EMBED:-1}"
@@ -97,5 +100,5 @@ export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
 export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR REP_STOP
+export SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MAX_NUM_SEQS MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR REP_STOP VISION_IMAGES
 export ATS_LAYERS ATS_MTP ATS_EMBED

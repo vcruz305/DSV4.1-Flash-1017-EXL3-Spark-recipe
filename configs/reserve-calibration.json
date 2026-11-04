@@ -1,0 +1,40 @@
+{
+ "rexl3-vic-overlay": {
+  "preload_avail_gib": 116.6,
+  "ready_min_gib": 2.38,
+  "kvb": 1073741824,
+  "maxlen": 524288,
+  "cold_gib": 7.203,
+  "note": "one boot 2026-11-03 + bench7 and 32K varied prefill; shipped 1,418-expert selection on REXL3 1.55bpw (experimental overlay)",
+  "measured": [
+   {
+    "cold_gib": 7.2,
+    "reserve_used_gib": 0,
+    "decode_tps": 34.0,
+    "ms_step": 133.6,
+    "prefill_2k": 494,
+    "prefill_7k": 796,
+    "note": "warm boot, shipped set"
+   },
+   {
+    "cold_gib": 17.02,
+    "reserve_used_gib": 0,
+    "decode_tps": 32.3,
+    "ms_step": 138.4,
+    "prefill_2k": 500,
+    "prefill_7k": 793,
+    "nvme_gib_bench7": 16.1
+   },
+   {
+    "cold_gib": 17.02,
+    "reserve_used_gib": 11,
+    "decode_tps": 26.3,
+    "ms_step": 195.0,
+    "prefill_2k": 214,
+    "prefill_7k": 330,
+    "nvme_gib_bench7": 62.0,
+    "note": "11 GiB anon hog touched"
+   }
+  ]
+ }
+}

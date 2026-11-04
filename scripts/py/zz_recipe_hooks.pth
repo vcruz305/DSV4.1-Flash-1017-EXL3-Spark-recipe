@@ -1,0 +1,1 @@
+import sys; "/recipe-py" in sys.path or sys.path.insert(0, "/recipe-py"); import recipe_hooks

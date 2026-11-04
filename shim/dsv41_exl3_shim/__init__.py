@@ -63,6 +63,7 @@ complete.  See ``_install_dsml_param_repair``.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
 
@@ -223,6 +224,60 @@ def _install_mem_probe() -> None:
     DefaultModelLoader.load_model = load_model
 
 
+def _alias_vision(model, ats_alias) -> None:
+    """Serve the vision tower's weights from the pack shard instead of GPU memory.
+
+    With images on, the ViT and aligner (0.9 GiB BF16) otherwise sit in CUDA memory
+    whether or not a request carries an image. Aliased through ATS they live in
+    page cache: the kernel can drop them when memory is tight and the GPU reads
+    them back from the SSD on the next image. Each view is checked byte-equal to
+    the loaded weight before it replaces it. ``DSV41_VISION_ATS=0`` keeps them
+    resident.
+    """
+    if os.environ.get("DSV41_VISION_ATS", "1") in ("0", "", "false", "off"):
+        return
+    import torch
+    from torch.nn import Parameter
+
+    model_dir = os.environ.get("VLLM_EXL3_MODEL_DIR") or os.environ.get("VLLM_ENGRAM_MODEL_DIR", "")
+    idx = ats_alias._pack_index()
+    headers: dict = {}
+    done = nbytes = 0
+    for name, mod in model.named_modules():
+        if not name.startswith(("vision.", "aligner.")):
+            continue
+        for pname, w in list(mod.named_parameters(recurse=False)):
+            key = f"{name}.{pname}"
+            shard = idx.get(key)
+            if not shard or not torch.is_tensor(w) or w.device.type != "cuda" or w.dtype != torch.bfloat16:
+                continue
+            if shard not in headers:
+                path = os.path.join(model_dir, shard)
+                with open(path, "rb") as fh:
+                    n = int.from_bytes(fh.read(8), "little")
+                    headers[shard] = (path, 8 + n, json.loads(fh.read(n)))
+            path, base, hdr = headers[shard]
+            ent = hdr.get(key)
+            if not ent or ent.get("dtype") != "BF16" or tuple(ent["shape"]) != tuple(w.shape):
+                continue
+            b, e = ent["data_offsets"]
+            if (base + b) % 16:
+                continue
+            view = ats_alias._ats_view(path, base + b, e - b, tuple(w.shape), w.dtype, w.device)
+            if not torch.equal(view, w.data):
+                print(f"VISION ATS: {key} differs from the loaded weight, kept resident", flush=True)
+                continue
+            p = Parameter(view, requires_grad=False)
+            if hasattr(w, "weight_loader"):
+                p.weight_loader = w.weight_loader
+            setattr(mod, pname, p)
+            done += 1
+            nbytes += e - b
+    if done:
+        torch.cuda.empty_cache()
+        print(f"VISION ATS: {done} tensors, {nbytes / 2**30:.2f} GiB served from the pack", flush=True)
+
+
 def _install_ats_alias() -> None:
     """Alias ``embed.weight`` (and optionally prefetch expert aliases) after load.
 
@@ -246,6 +301,7 @@ def _install_ats_alias() -> None:
             from vllm_exl3 import ats_alias
 
             n = ats_alias.alias_embedding(model)
+            _alias_vision(model, ats_alias)
             ats_alias.prefetch()
             ats_alias.log_stats()
             print(
@@ -346,46 +402,6 @@ def _install_rope_trim() -> None:
     DefaultModelLoader.load_model = load_model
 
 
-def _install_repetition_stop() -> None:
-    """Default ``repetition_detection`` for requests that do not set it.
-
-    In long agentic turns (Hermes, a multi-file build task) the reasoning can fall
-    into an exact loop and run to the 32,768-token cap: 15 min of decode with no
-    tool call, after which the client drops the reply. vLLM can stop such a reply
-    (``RepetitionDetectionParams``: the last ``COUNT`` blocks of ``L`` tokens are
-    identical, for some ``L`` in ``MIN..MAX``) but only when the request asks.
-    ``MIN`` stays at 64: a shorter loop is also a loop of a longer period, while a
-    short period would end legit output such as a literal grid of identical rows.
-    ``COUNT=8`` means at least 512 tokens of exact repetition. The check is cheap:
-    for each ``L`` it stops at the first token that differs.
-    """
-    raw = os.environ.get("DSV41_REP_STOP", "64:512:8").strip()
-    if raw in ("0", "", "false", "off"):
-        return
-    from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
-
-    try:
-        lo, hi, count = (int(x) for x in raw.split(":"))
-        RepetitionDetectionParams(max_pattern_size=hi, min_pattern_size=lo, min_count=count)
-    except Exception as exc:
-        print(f"DSV41_REP_STOP={raw!r} ignored (want MIN:MAX:COUNT): {exc!r}", flush=True)
-        return
-    orig = SamplingParams.update_from_tokenizer
-    if getattr(orig, "_dsv41_rep_stop", False):
-        return
-
-    def update_from_tokenizer(self, tokenizer):
-        orig(self, tokenizer)
-        if self.repetition_detection is None:
-            self.repetition_detection = RepetitionDetectionParams(
-                max_pattern_size=hi, min_pattern_size=lo, min_count=count
-            )
-
-    update_from_tokenizer._dsv41_rep_stop = True
-    update_from_tokenizer._dsv41_caps = getattr(orig, "_dsv41_caps", False)
-    SamplingParams.update_from_tokenizer = update_from_tokenizer
-
-
 def _install_sampling_caps() -> None:
     """Reject over-size sampling lists in the API server with a 400.
 
@@ -440,6 +456,46 @@ def _install_sampling_caps() -> None:
             _reject(f"bad_words tokenize to {n} tokens; the max is {max_tok}", "bad_words")
 
     update_from_tokenizer._dsv41_caps = True
+    SamplingParams.update_from_tokenizer = update_from_tokenizer
+
+
+def _install_repetition_stop() -> None:
+    """Default ``repetition_detection`` for requests that do not set it.
+
+    In long agentic turns (Hermes, a multi-file build task) the reasoning can fall
+    into an exact loop and run to the 32,768-token cap: 15 min of decode with no
+    tool call, after which the client drops the reply. vLLM can stop such a reply
+    (``RepetitionDetectionParams``: the last ``COUNT`` blocks of ``L`` tokens are
+    identical, for some ``L`` in ``MIN..MAX``) but only when the request asks.
+    ``MIN`` stays at 64: a shorter loop is also a loop of a longer period, while a
+    short period would end legit output such as a literal grid of identical rows.
+    ``COUNT=8`` means at least 512 tokens of exact repetition. The check is cheap:
+    for each ``L`` it stops at the first token that differs.
+    """
+    raw = os.environ.get("DSV41_REP_STOP", "64:512:8").strip()
+    if raw in ("0", "", "false", "off"):
+        return
+    from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
+
+    try:
+        lo, hi, count = (int(x) for x in raw.split(":"))
+        RepetitionDetectionParams(max_pattern_size=hi, min_pattern_size=lo, min_count=count)
+    except Exception as exc:
+        print(f"DSV41_REP_STOP={raw!r} ignored (want MIN:MAX:COUNT): {exc!r}", flush=True)
+        return
+    orig = SamplingParams.update_from_tokenizer
+    if getattr(orig, "_dsv41_rep_stop", False):
+        return
+
+    def update_from_tokenizer(self, tokenizer):
+        orig(self, tokenizer)
+        if self.repetition_detection is None:
+            self.repetition_detection = RepetitionDetectionParams(
+                max_pattern_size=hi, min_pattern_size=lo, min_count=count
+            )
+
+    update_from_tokenizer._dsv41_rep_stop = True
+    update_from_tokenizer._dsv41_caps = getattr(orig, "_dsv41_caps", False)
     SamplingParams.update_from_tokenizer = update_from_tokenizer
 
 
